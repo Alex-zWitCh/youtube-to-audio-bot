@@ -1,0 +1,17 @@
+[Unit]
+Description=YouTube to Audio Telegram Bot
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/yt-audio-bot
+Environment="YT_AUDIO_BOT_TOKEN=your_bot_token_from_botfather"
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.deno/bin"
+ExecStart=/opt/yt-audio-bot/venv/bin/python3 /opt/yt-audio-bot/bot.py
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target

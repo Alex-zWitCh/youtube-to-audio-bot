@@ -1,0 +1,2 @@
+# Clean up old YouTube audio downloads every hour
+0 * * * * root find /tmp/yt-audio-downloads -type f -mmin +60 -delete 2>/dev/null
