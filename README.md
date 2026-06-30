@@ -31,74 +31,18 @@ User sends YouTube link → Bot extracts info → Downloads audio (android clien
 - Python 3.12+
 - Telegram Bot Token (from [@BotFather](https://t.me/BotFather))
 
-### Quick Install (one command)
+### Quick Install
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/Alex-zWitCh/youtube-to-audio-bot/main/install.sh | sudo bash
 ```
 
-Or with your token:
+Или с токеном (не будет запроса):
 ```bash
 curl -sSL https://raw.githubusercontent.com/Alex-zWitCh/youtube-to-audio-bot/main/install.sh | sudo bash -s -- YOUR_BOT_TOKEN
 ```
 
-### Manual Installation
-
-```bash
-# 1. Install system dependencies
-apt-get update
-apt-get install -y ffmpeg python3-venv python3-pip
-
-# 2. Install deno (JavaScript runtime for yt-dlp)
-curl -fsSL https://deno.land/install.sh | sh
-
-# 3. Create virtual environment
-python3 -m venv /opt/yt-audio-bot/venv
-source /opt/yt-audio-bot/venv/bin/activate
-
-# 4. Install Python packages
-pip install yt-dlp python-telegram-bot Pillow mutagen
-
-# 5. Download bot script
-mkdir -p /opt/yt-audio-bot
-curl -o /opt/yt-audio-bot/bot.py https://raw.githubusercontent.com/Alex-zWitCh/youtube-to-audio-bot/main/bot.py
-chmod +x /opt/yt-audio-bot/bot.py
-
-# 6. Create systemd service
-cat > /etc/systemd/system/yt-audio-bot.service << 'UNIT'
-[Unit]
-Description=YouTube to Audio Telegram Bot
-After=network.target
-Wants=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/opt/yt-audio-bot
-Environment="YT_AUDIO_BOT_TOKEN=your_bot_token_here"
-Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.deno/bin"
-ExecStart=/opt/yt-audio-bot/venv/bin/python3 /opt/yt-audio-bot/bot.py
-Restart=on-failure
-RestartSec=10s
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-# 7. Start the bot
-systemctl daemon-reload
-systemctl enable --now yt-audio-bot
-
-# 8. Set up cleanup cron
-cat > /etc/cron.d/yt-audio-cleanup << 'CRON'
-0 * * * * root find /tmp/yt-audio-downloads -type f -mmin +60 -delete 2>/dev/null
-CRON
-chmod 644 /etc/cron.d/yt-audio-cleanup
-
-# 9. Create temp directory
-mkdir -p /tmp/yt-audio-downloads
-chmod 777 /tmp/yt-audio-downloads
-```
+Скрипт сам установит всё необходимое: ffmpeg, deno, Python-зависимости, создаст systemd сервис, настроит cron очистки.
 
 ### Update
 
@@ -212,66 +156,18 @@ Telegram-бот, который конвертирует YouTube-видео в �
   → Отправляет файл(ы) через Telegram → Удаляет с сервера
 ```
 
-### Быстрая установка (одна команда)
+### Быстрая установка
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/Alex-zWitCh/youtube-to-audio-bot/main/install.sh | sudo bash
 ```
 
-Или с токеном:
+Или с токеном (без запроса):
 ```bash
 curl -sSL https://raw.githubusercontent.com/Alex-zWitCh/youtube-to-audio-bot/main/install.sh | sudo bash -s -- YOUR_BOT_TOKEN
 ```
 
-### Установка вручную
-
-```bash
-# 1. Системные зависимости
-apt-get update
-apt-get install -y ffmpeg python3-venv python3-pip
-
-# 2. Установка deno (JavaScript runtime для yt-dlp)
-curl -fsSL https://deno.land/install.sh | sh
-
-# 3. Виртуальное окружение
-python3 -m venv /opt/yt-audio-bot/venv
-source /opt/yt-audio-bot/venv/bin/activate
-pip install yt-dlp python-telegram-bot Pillow mutagen
-
-# 4. Скачать скрипт
-mkdir -p /opt/yt-audio-bot
-curl -o /opt/yt-audio-bot/bot.py https://raw.githubusercontent.com/Alex-zWitCh/youtube-to-audio-bot/main/bot.py
-chmod +x /opt/yt-audio-bot/bot.py
-
-# 5. systemd сервис
-cat > /etc/systemd/system/yt-audio-bot.service << 'UNIT'
-[Unit]
-Description=YouTube to Audio Telegram Bot
-After=network.target
-Wants=network.target
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/opt/yt-audio-bot
-Environment="YT_AUDIO_BOT_TOKEN=your_bot_token_here"
-Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.deno/bin"
-ExecStart=/opt/yt-audio-bot/venv/bin/python3 /opt/yt-audio-bot/bot.py
-Restart=on-failure
-RestartSec=10s
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-systemctl daemon-reload && systemctl enable --now yt-audio-bot
-
-# 6. Cron очистки
-cat > /etc/cron.d/yt-audio-cleanup << 'CRON'
-0 * * * * root find /tmp/yt-audio-downloads -type f -mmin +60 -delete 2>/dev/null
-CRON
-chmod 644 /etc/cron.d/yt-audio-cleanup
-
-mkdir -p /tmp/yt-audio-downloads && chmod 777 /tmp/yt-audio-downloads
-```
+Скрипт сам установит всё необходимое: ffmpeg, deno, Python-зависимости, создаст systemd сервис, настроит cron очистки.
 
 ### Настройка в BotFather
 
