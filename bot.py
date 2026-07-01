@@ -119,6 +119,12 @@ def cleanup_old_files():
         logger.info(f"Cleaned up {removed} old file(s)")
 
 
+def _do_download(ydl_opts: dict, url: str) -> dict:
+    """Run yt-dlp download in a separate thread (for executor)."""
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        return ydl.extract_info(url, download=True)
+
+
 async def run_ffmpeg_with_progress(
     cmd: list,
     total_duration: float,
@@ -190,11 +196,20 @@ def split_audio_file(file_path: str, max_size: int, base_name: str) -> list:
     """
     Split audio file into parts if it exceeds max_size.
     Uses ffmpeg with -ss/-to and stream copy.
-    Returns list of (part_path, part_number, total_parts).
+    Returns list of (part_path, part_number, total_parts, part_duration_secs).
     """
     file_size = os.path.getsize(file_path)
     if file_size <= max_size:
-        return [(file_path, 1, 1)]
+        # Probe actual duration of single file
+        probe_cmd = [
+            "ffprobe", "-v", "quiet",
+            "-print_format", "json",
+            "-show_format", file_path
+        ]
+        probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
+        probe_data = json.loads(probe_result.stdout)
+        total_duration = float(probe_data["format"]["duration"])
+        return [(file_path, 1, 1, total_duration)]
 
     # Get duration via ffprobe
     probe_cmd = [
@@ -232,6 +247,7 @@ def split_audio_file(file_path: str, max_size: int, base_name: str) -> list:
                 "-y",
                 part_path
             ]
+            actual_duration = part_duration
         else:
             split_cmd = [
                 "nice", "-n", "19",
@@ -242,9 +258,10 @@ def split_audio_file(file_path: str, max_size: int, base_name: str) -> list:
                 "-y",
                 part_path
             ]
+            actual_duration = total_duration - start
 
         subprocess.run(split_cmd, capture_output=True, check=True)
-        parts.append((part_path, part_num, num_parts))
+        parts.append((part_path, part_num, num_parts, actual_duration))
 
     # Remove original file
     os.remove(file_path)
@@ -422,31 +439,74 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
 
-        # ── Step 2: Download audio with yt-dlp ──
+        # ── Step 2: Download audio with yt-dlp (with progress) ──
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         source_template = os.path.join(
             DOWNLOAD_DIR, f"{timestamp}_{safe_title}_source.%(ext)s"
         )
+
+        # Progress tracker for yt-dlp download
+        dl_progress = {"pct": 0, "speed": "", "eta": "", "finished": False}
+
+        def progress_hook(d):
+            if d["status"] == "downloading":
+                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                downloaded = d.get("downloaded_bytes", 0)
+                if total > 0:
+                    dl_progress["pct"] = downloaded / total * 100
+                    dl_progress["speed"] = d.get("_speed_str", "")
+                    dl_progress["eta"] = d.get("_eta_str", "")
+            elif d["status"] == "finished":
+                dl_progress["finished"] = True
+                dl_progress["pct"] = 100
 
         ydl_opts = {
             "format": "worst",
             "outtmpl": source_template,
             "quiet": True,
             "no_warnings": True,
+            "progress_hooks": [progress_hook],
             "extractor_args": {"youtube": {"player_client": ["android"]}},
         }
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(text, download=True)
-            source_ext = info.get("ext", "webm")
-            source_path = os.path.join(
-                DOWNLOAD_DIR, f"{timestamp}_{safe_title}_source.{source_ext}"
+        # Run download in executor to allow progress updates
+        loop = asyncio.get_event_loop()
+        download_future = loop.run_in_executor(None, _do_download, ydl_opts, text)
+
+        last_update = 0
+        while not download_future.done():
+            await asyncio.sleep(2)
+            pct = dl_progress["pct"]
+            now_t = time.time()
+            if pct > 0 and (now_t - last_update >= 5):
+                last_update = now_t
+                speed = dl_progress["speed"]
+                eta = dl_progress["eta"]
+                bar_len = 12
+                filled = int(bar_len * pct / 100)
+                bar = "▓" * filled + "░" * (bar_len - filled)
+                try:
+                    await status_msg.edit_text(
+                        f"📥 <b>{escape_html(title)}</b>\n"
+                        f"👤 {escape_html(uploader)} | ⏱ {duration_str}\n\n"
+                        f"⬇️ Скачиваю…\n"
+                        f"{bar} {pct:.0f}%\n"
+                        f"💾 {speed} | ⏱ {eta}",
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
+
+        info = await download_future
+        source_ext = info.get("ext", "webm")
+        source_path = os.path.join(
+            DOWNLOAD_DIR, f"{timestamp}_{safe_title}_source.{source_ext}"
+        )
+        if not os.path.exists(source_path):
+            candidates = glob.glob(
+                os.path.join(DOWNLOAD_DIR, f"{timestamp}_{safe_title}_source.*")
             )
-            if not os.path.exists(source_path):
-                candidates = glob.glob(
-                    os.path.join(DOWNLOAD_DIR, f"{timestamp}_{safe_title}_source.*")
-                )
-                source_path = candidates[0] if candidates else None
+            source_path = candidates[0] if candidates else None
 
         if not source_path or not os.path.exists(source_path):
             raise Exception("Source file not found after download")
@@ -459,7 +519,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if thumbnail_url:
             try:
                 thumb_path = os.path.join(DOWNLOAD_DIR, f"{timestamp}_{safe_title}_thumb.jpg")
-                import urllib.request
                 urllib.request.urlretrieve(thumbnail_url, thumb_path)
                 # Verify it's a valid image
                 with Image.open(thumb_path) as img_check:
@@ -589,20 +648,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{timestamp}_{safe_title}"
             )
         else:
-            parts = [(output_path, 1, 1)]
+            # Probe duration of single file
+            probe_cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", output_path]
+            probe_r = subprocess.run(probe_cmd, capture_output=True, text=True)
+            single_dur = float(json.loads(probe_r.stdout)["format"]["duration"])
+            parts = [(output_path, 1, 1, single_dur)]
 
         # ── Step 5: Send file(s) ──
-        total_parts = parts[0][2]
-        total_str = format_duration(duration)
-
-        for part_path, part_num, total in parts:
+        for part_path, part_num, total, part_dur in parts:
             part_size = os.path.getsize(part_path)
 
-            # Build caption
+            # Build caption with actual part duration
             caption_parts = [
                 f"<b>{escape_html(title)}</b>",
                 f"👤 {escape_html(uploader)}",
-                f"⏱ {duration_str}",
+                f"⏱ {format_duration(int(part_dur))}",
             ]
             if total > 1:
                 caption_parts.append(f"📦 Часть {part_num} из {total} — {format_size(part_size)}")
@@ -625,7 +685,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await status_msg.edit_text(
                     f"📤 <b>{escape_html(title)}</b>\n"
-                    f"📦 {format_size(part_size)} | ⏱ {duration_str}\n\n"
+                    f"📦 {format_size(part_size)} | ⏱ {format_duration(int(part_dur))}\n\n"
                     f"⬆️ Отправляю…",
                     parse_mode="HTML"
                 )
@@ -636,7 +696,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     audio=f,
                     title=audio_title,
                     performer=uploader[:256],
-                    duration=duration,
+                    duration=int(part_dur),
                     caption=caption,
                     parse_mode="HTML",
                     reply_to_message_id=update.message.message_id
