@@ -8,10 +8,11 @@ A Telegram bot that converts YouTube videos to ultra-compressed Opus audio (12 k
 - 🔹 **Cover art:** YouTube thumbnail embedded as album artwork
 - 🔹 **Metadata:** title, author, description, source link embedded in file
 - 🔹 **Auto-split:** files larger than 45 MB are split into numbered parts (`part 1 of 4`, etc.)
-- 🔹 **Low CPU impact:** `nice -n 19` + `ionice -c 3` + single thread (минимальная нагрузка на сервер)
+- 🔹 **Low CPU impact:** `nice -n 19` + `ionice -c 3` + single thread — minimal server load
 - 🔹 **Progress indicator:** shows download speed + encoding progress with ETA
 - 🔹 **Public bot:** no registration required, anyone can send a link
 - 🔹 **File cleanup:** files are deleted immediately after sending; cron cleans orphans every hour
+
 
 ## How It Works
 
@@ -37,12 +38,12 @@ User sends YouTube link → Bot extracts info → Downloads audio (android clien
 curl -sSL https://raw.githubusercontent.com/Alex-zWitCh/youtube-to-audio-bot/main/install.sh | sudo bash
 ```
 
-Или с токеном (не будет запроса):
+Or with a token (no prompt):
 ```bash
 curl -sSL https://raw.githubusercontent.com/Alex-zWitCh/youtube-to-audio-bot/main/install.sh | sudo bash -s -- YOUR_BOT_TOKEN
 ```
 
-Скрипт сам установит всё необходимое: ffmpeg, deno, Python-зависимости, создаст systemd сервис, настроит cron очистки.
+The script installs everything automatically: ffmpeg, deno, Python packages, systemd service, cleanup cron.
 
 ### Update
 
