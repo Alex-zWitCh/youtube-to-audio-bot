@@ -94,3 +94,4 @@ Before any download:
 | `LOG_DIR` | `/var/log/yt-audio-bot` | Log directory |
 | `LOG_MAX_SIZE` | 1 MB | Rotating log file size |
 | `LOG_BACKUP_COUNT` | 3 | Number of old log files |
+| `YT_AUDIO_VIP_USERS` | — | Comma-separated user IDs with queue priority |

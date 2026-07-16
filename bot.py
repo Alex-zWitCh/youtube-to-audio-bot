@@ -52,6 +52,7 @@ DOWNLOAD_DIR = "/tmp/yt-audio-downloads"
 MAX_FILE_SIZE = 45 * 1024 * 1024  # 45 MB safety margin
 CLEANUP_AGE = 3600  # 1 hour
 MAX_QUEUE_SIZE = 5  # max waiting users (anti-DDoS)
+VIP_USERS = set(filter(None, os.environ.get("YT_AUDIO_VIP_USERS", "").split(",")))
 LOG_DIR = "/var/log/yt-audio-bot"
 LOG_MAX_SIZE = 1 * 1024 * 1024  # 1 MB per file
 LOG_BACKUP_COUNT = 3  # 3 files max = ~3 MB total
@@ -472,13 +473,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # If someone else is busy → queue this user (max 5)
     if _active_downloads:
+        is_vip = str(user_id) in VIP_USERS
         if len(_queue) >= MAX_QUEUE_SIZE:
-            await update.message.reply_text(
-                "⏳ Очередь переполнена. Попробуй позже.",
-                reply_to_message_id=update.message.message_id
-            )
-            logger.info(f"Queue full: user={user_id}, video_id={video_id} rejected")
-            return
+            if is_vip:
+                # VIP: kick the last regular user from queue
+                kicked = _queue.pop()
+                try:
+                    await kicked["status_msg"].edit_text(
+                        "⚠️ Ваше место в очереди занял приоритетный пользователь. Попробуйте позже."
+                    )
+                except Exception:
+                    pass
+                logger.info(f"VIP {user_id} kicked {kicked['user_id']} from queue")
+            else:
+                await update.message.reply_text(
+                    "⏳ Очередь переполнена. Попробуй позже.",
+                    reply_to_message_id=update.message.message_id
+                )
+                logger.info(f"Queue full: user={user_id}, video_id={video_id} rejected")
+                return
         busy_user = next(iter(_active_downloads))
         busy_stage = _active_downloads[busy_user].get("stage", "processing")
         status_msg = await update.message.reply_text(

@@ -67,6 +67,7 @@ All configuration is via environment variables (set in the systemd service file)
 | `DOWNLOAD_DIR` | `/tmp/yt-audio-downloads` | Temp directory for downloads |
 | `MAX_FILE_SIZE` | `45 MB` | Split threshold |
 | `CLEANUP_AGE` | `3600` (1 hour) | Max file age before cleanup |
+| `YT_AUDIO_VIP_USERS` | — | Comma-separated Telegram user IDs with queue priority |
 
 ## BotFather Setup
 
@@ -144,6 +145,7 @@ This ensures `/cancel`, queue, and messages from other users are processed insta
 
 ### Queue & Anti-DDoS
 - Max **5 queued** requests — additional users get "Queue full, try later"
+- **VIP users** (`YT_AUDIO_VIP_USERS`): always enter queue, kick the last regular user if full
 - Same user sending multiple links while queued: "Wait your turn"
 - `/cancel` removes from queue or kills active process
 - After completion, next queue item starts automatically
@@ -225,6 +227,7 @@ curl -sSL https://raw.githubusercontent.com/Alex-zWitCh/youtube-to-audio-bot/mai
 | `DOWNLOAD_DIR` | `/tmp/yt-audio-downloads` | Временная папка для загрузок |
 | `MAX_FILE_SIZE` | `45 MB` | Порог для сплита |
 | `CLEANUP_AGE` | `3600` (1 час) | Макс. возраст файла перед очисткой |
+| `YT_AUDIO_VIP_USERS` | — | ID пользователей Telegram через запятую (приоритет очереди) |
 
 ### Детали
 
