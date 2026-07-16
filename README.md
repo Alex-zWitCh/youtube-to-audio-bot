@@ -10,8 +10,12 @@ A Telegram bot that converts YouTube videos to ultra-compressed Opus audio (12 k
 - 🔹 **Auto-split:** files larger than 45 MB are split into numbered parts (`part 1 of 4`, etc.)
 - 🔹 **Low CPU impact:** `nice -n 19` + `ionice -c 3` + single thread — minimal server load
 - 🔹 **Progress indicator:** shows download speed + encoding progress with ETA
+- 🔹 **Queue system:** max 5 waiting users — anti-DDoS protection
+- 🔹 **Concurrent updates:** /cancel and new links work while processing
+- 🔹 **Disk guard:** checks free space before each download
+- 🔹 **Async architecture:** all blocking I/O in executors, non-blocking ffmpeg
 - 🔹 **Public bot:** no registration required, anyone can send a link
-- 🔹 **File cleanup:** files are deleted immediately after sending; cron cleans orphans every hour
+- 🔹 **File cleanup:** files deleted after sending; cron cleans orphans
 
 
 ## How It Works
@@ -123,6 +127,38 @@ When the compressed audio exceeds 45 MB:
 2. Number of parts = `ceil(file_size / 45 MB)`
 3. Each part is extracted using `ffmpeg -ss` / `-to` with stream copy
 4. Files are sent as `Title_part1_of_4.opus`, `Title_part2_of_4.opus`, etc.
+
+## Technical Notes
+
+### Async Architecture
+The bot uses `python-telegram-bot` with `concurrent_updates=True`. **PTB processes updates sequentially by default** — without this flag, while one user's download is processing, all other commands (/cancel, links from other users) would be queued by PTB itself and never reach the handler. With concurrent updates, each command runs in its own asyncio task.
+
+### Non-blocking Operations
+All blocking I/O runs in thread pool executors or uses async subprocess:
+- **ffmpeg**: `asyncio.create_subprocess_exec` — event loop stays responsive
+- **yt-dlp**: `run_in_executor` — download in background thread
+- **ffprobe**: `run_in_executor`
+- **Thumbnail**: `run_in_executor` (urllib + PIL)
+
+This ensures `/cancel`, queue, and messages from other users are processed instantly during conversion.
+
+### Queue & Anti-DDoS
+- Max **5 queued** requests — additional users get "Queue full, try later"
+- Same user sending multiple links while queued: "Wait your turn"
+- `/cancel` removes from queue or kills active process
+- After completion, next queue item starts automatically
+
+### Disk Space Guard
+Before each download:
+1. Minimum **200 MB** free required to start processing
+2. Source file size must fit within free space minus 200 MB margin
+3. If either check fails: user gets clear error with exact MB requirements
+
+### File Cleanup Schedule
+| File type | Age | Cron interval |
+|---|---|---|
+| `.part` (orphaned) | > 15 min | Every 5 min |
+| `.mp4`, `.opus`, `.jpg` (completed) | > 60 min | Every 5 min |
 
 ## License
 

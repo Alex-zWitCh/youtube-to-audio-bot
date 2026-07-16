@@ -25,12 +25,15 @@ import json
 import html
 import logging
 import asyncio
+import threading
 import subprocess
 import traceback
 import urllib.request
 import concurrent.futures
 from pathlib import Path
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
+from collections import deque
 
 import yt_dlp
 from PIL import Image
@@ -48,20 +51,38 @@ BOT_TOKEN = os.environ.get("YT_AUDIO_BOT_TOKEN", "")
 DOWNLOAD_DIR = "/tmp/yt-audio-downloads"
 MAX_FILE_SIZE = 45 * 1024 * 1024  # 45 MB safety margin
 CLEANUP_AGE = 3600  # 1 hour
+MAX_QUEUE_SIZE = 5  # max waiting users (anti-DDoS)
+LOG_DIR = "/var/log/yt-audio-bot"
+LOG_MAX_SIZE = 1 * 1024 * 1024  # 1 MB per file
+LOG_BACKUP_COUNT = 3  # 3 files max = ~3 MB total
+
 # yt-dlp JS runtime path (deno)
 os.environ["PATH"] = os.environ.get("PATH", "") + ":/root/.deno/bin"
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
 
-# Active download tracking: {user_id: {"url": str, "video_id": str, "proc": Popen|None, "files": [str], ...}}
-_active_downloads = {}
-_active_urls = set()
+# ── Logging setup: file (rotating) + console (stderr) ──
+log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+log_file = os.path.join(LOG_DIR, "bot.log")
+file_handler = RotatingFileHandler(log_file, maxBytes=LOG_MAX_SIZE, backupCount=LOG_BACKUP_COUNT)
+file_handler.setFormatter(log_formatter)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
 
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(level=logging.INFO, handlers=[file_handler, console_handler])
+
+# Suppress noisy httpx polling logs
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
+
+# ── Queue system ──
+# _active_downloads[user_id] = {url, video_id, proc, files, stage, status_msg, cancel_event}
+# stage: "downloading" | "converting" | "sending" | "done"
+_active_downloads = {}
+_active_urls = set()  # video_ids currently in active processing (not queued)
+_queue = deque()  # items: {user_id, video_id, url, update, status_msg}
 
 # ═══════════════════════════════════════════
 # Helpers
@@ -111,6 +132,16 @@ def cleanup_old_files():
     removed = 0
     for f in glob.glob(os.path.join(DOWNLOAD_DIR, "*")):
         if os.path.isfile(f):
+            # Always remove yt-dlp .part temp files (residue from failed downloads)
+            if f.endswith(".part"):
+                try:
+                    os.remove(f)
+                    removed += 1
+                    logger.info(f"Removed orphaned .part: {os.path.basename(f)}")
+                except OSError:
+                    pass
+                continue
+            # Remove old files past cleanup age
             age = now - os.path.getmtime(f)
             if age > CLEANUP_AGE:
                 os.remove(f)
@@ -125,6 +156,12 @@ def _do_download(ydl_opts: dict, url: str) -> dict:
         return ydl.extract_info(url, download=True)
 
 
+def _do_extract_info(ydl_opts: dict, url: str) -> dict:
+    """Run yt-dlp info extraction in executor (non-blocking)."""
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
 async def run_ffmpeg_with_progress(
     cmd: list,
     total_duration: float,
@@ -134,8 +171,9 @@ async def run_ffmpeg_with_progress(
     stage: str = "Конвертирую"
 ) -> int:
     """
-    Run ffmpeg with CPU throttling (nice+ionice) in a thread.
+    Run ffmpeg with CPU throttling (nice+ionice) using async subprocess.
     Progress estimated by elapsed time. Stores process ref for cancellation.
+    Does NOT block event loop — other users get responses.
     """
     throttled_cmd = [
         "nice", "-n", "19",
@@ -146,11 +184,11 @@ async def run_ffmpeg_with_progress(
     last_update = 0
     last_pct = -1
 
-    # Use Popen so we can kill it later via /cancel
-    proc = subprocess.Popen(
-        throttled_cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+    # Async subprocess — non-blocking!
+    proc = await asyncio.create_subprocess_exec(
+        *throttled_cmd,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
     )
 
     # Store process ref for cancellation
@@ -159,9 +197,9 @@ async def run_ffmpeg_with_progress(
 
     while True:
         try:
-            proc.wait(timeout=5)
+            await asyncio.wait_for(proc.wait(), timeout=5)
             break
-        except subprocess.TimeoutExpired:
+        except asyncio.TimeoutError:
             # Check if cancelled
             if user_id and user_id not in _active_downloads:
                 proc.kill()
@@ -319,9 +357,20 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancel current download and clean up files."""
+    """Cancel current download or remove from queue."""
     user_id = update.effective_user.id
-    global _active_downloads, _active_urls
+    global _active_downloads, _active_urls, _queue
+
+    # Check if user is in queue
+    for i, item in enumerate(_queue):
+        if item["user_id"] == user_id:
+            del _queue[i]
+            await update.message.reply_text(
+                "✅ Вы удалены из очереди.",
+                reply_to_message_id=update.message.message_id
+            )
+            logger.info(f"User {user_id} removed from queue")
+            return
 
     if user_id not in _active_downloads:
         await update.message.reply_text(
@@ -332,9 +381,13 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     info = _active_downloads[user_id]
     video_id = info["video_id"]
-    url = info["url"]
 
-    # Kill the running process if any
+    # Set cancel event flag for yt-dlp executor
+    cancel_event = info.get("cancel_event")
+    if cancel_event:
+        cancel_event.set()
+
+    # Kill the running process (ffmpeg)
     proc = info.get("proc")
     if proc and proc.poll() is None:
         try:
@@ -353,15 +406,18 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except OSError:
             pass
 
-    # Clean up tracking
+    # Remove from tracking
     _active_downloads.pop(user_id, None)
     _active_urls.discard(video_id)
 
     await update.message.reply_text(
-        f"✅ Задача отменена. Временные файлы удалены.",
+        "✅ Задача отменена. Временные файлы удалены.",
         reply_to_message_id=update.message.message_id
     )
     logger.info(f"User {user_id} cancelled download of {video_id}")
+
+    # Start next in queue
+    await _process_next_in_queue()
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -387,14 +443,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     video_id = vid_match.group(1) if vid_match else text
     user_id = update.effective_user.id
 
-    # Check for concurrent downloads
-    global _active_downloads, _active_urls
+    global _active_downloads, _active_urls, _queue
+
+    # Check concurrent: same user already active
     if user_id in _active_downloads:
         await update.message.reply_text(
-            "⏳ Уже обрабатываю другое видео. Дождись завершения.",
+            "⏳ Уже обрабатываю ссылку. Дождись завершения или отправь /cancel.",
             reply_to_message_id=update.message.message_id
         )
         return
+
+    # Check concurrent: same user in queue
+    for item in _queue:
+        if item["user_id"] == user_id:
+            await update.message.reply_text(
+                "⏳ Дождитесь своей очереди.",
+                reply_to_message_id=update.message.message_id
+            )
+            return
+
+    # Check concurrent: same video already being processed
     if video_id in _active_urls:
         await update.message.reply_text(
             "⏳ Это видео уже обрабатывается. Дождись завершения.",
@@ -402,35 +470,90 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Mark as active
-    _active_downloads[user_id] = {"url": text, "video_id": video_id, "files": []}
+    # If someone else is busy → queue this user (max 5)
+    if _active_downloads:
+        if len(_queue) >= MAX_QUEUE_SIZE:
+            await update.message.reply_text(
+                "⏳ Очередь переполнена. Попробуй позже.",
+                reply_to_message_id=update.message.message_id
+            )
+            logger.info(f"Queue full: user={user_id}, video_id={video_id} rejected")
+            return
+        busy_user = next(iter(_active_downloads))
+        busy_stage = _active_downloads[busy_user].get("stage", "processing")
+        status_msg = await update.message.reply_text(
+            f"⏳ Бот занят ({busy_stage}). Вы в очереди — ожидайте.",
+            reply_to_message_id=update.message.message_id
+        )
+        _queue.append({
+            "user_id": user_id,
+            "video_id": video_id,
+            "url": text,
+            "update": update,
+            "context": context,
+            "status_msg": status_msg,
+        })
+        logger.info(f"User {user_id} queued (busy: {busy_user}), video_id={video_id}")
+        return
+
+    # Free slot — start processing
+    logger.info(f"New download: user={user_id}, video_id={video_id}, url={text[:80]}")
+    await _start_processing(update, context, text, user_id, video_id)
+
+
+async def _start_processing(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, user_id: int, video_id: str):
+    """Run the full download → convert → send pipeline."""
+    global _active_downloads, _active_urls, _queue
+
+    # Mark as active with stage tracking
+    cancel_event = threading.Event()
+    _active_downloads[user_id] = {"url": text, "video_id": video_id, "files": [], "proc": None, "stage": "starting", "cancel_event": cancel_event}
     _active_urls.add(video_id)
 
+    # ── Step 0: Check disk space ──
+    st = os.statvfs(DOWNLOAD_DIR)
+    free_bytes = st.f_frsize * st.f_bavail
+    free_mb = free_bytes / 1024 / 1024
+    MIN_FREE_MB = 200
+    if free_mb < MIN_FREE_MB:
+        raise Exception(f"Недостаточно места на диске: {free_mb:.0f} MB свободно. Нужно минимум {MIN_FREE_MB} MB.")
+
+    success = False
+    status_msg = None
     try:
         status_msg = await update.message.reply_text("⏳ Получаю информацию о видео...")
+        _active_downloads[user_id]["status_msg"] = status_msg
 
-        # ── Step 1: Extract info ──
+        # ── Step 1: Extract info (in executor to not block event loop) ──
+        _active_downloads[user_id]["stage"] = "extracting info"
+        logger.info(f"Extracting info: user={user_id}, video_id={video_id}")
         ydl_opts_info = {"quiet": True, "no_warnings": True}
         ydl_opts_info["extractor_args"] = {"youtube": {"player_client": ["android"]}}
-        with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
-            info = ydl.extract_info(text, download=False)
-            title = info.get("title", "Unknown")
-            uploader = info.get("uploader", "Unknown")
-            duration = info.get("duration", 0)
-            description = (info.get("description") or "")[:500]
-            webpage_url = info.get("webpage_url", text)
-            # Get best thumbnail URL
-            thumbnails = info.get("thumbnails") or []
-            thumbnail_url = ""
-            if thumbnails:
-                # Pick the highest resolution thumbnail
-                thumbnail_url = sorted(thumbnails, key=lambda t: t.get("preference", 0) or t.get("height", 0) or 0, reverse=True)[0].get("url", "")
-            if not thumbnail_url:
-                thumbnail_url = info.get("thumbnail", "")
+        loop = asyncio.get_event_loop()
+        info = await loop.run_in_executor(None, _do_extract_info, ydl_opts_info, text)
+        title = info.get("title", "Unknown")
+        uploader = info.get("uploader", "Unknown")
+        duration = info.get("duration", 0)
+        description = (info.get("description") or "")[:500]
+        webpage_url = info.get("webpage_url", text)
+        thumbnails = info.get("thumbnails") or []
+        thumbnail_url = ""
+        if thumbnails:
+            thumbnail_url = sorted(thumbnails, key=lambda t: t.get("preference", 0) or t.get("height", 0) or 0, reverse=True)[0].get("url", "")
+        if not thumbnail_url:
+            thumbnail_url = info.get("thumbnail", "")
 
         duration_str = format_duration(duration)
         short_desc = description[:200] + ("…" if len(description) > 200 else "")
         safe_title = sanitize(title, 120)
+
+        # ── Check disk space for the source file ──
+        source_size_mb = info.get("filesize", 0) / 1024 / 1024
+        if source_size_mb > 0 and source_size_mb > free_mb - 200:
+            raise Exception(
+                f"Недостаточно места: файл {source_size_mb:.0f} MB, "
+                f"свободно {free_mb:.0f} MB. Нужно минимум {source_size_mb + 200:.0f} MB."
+            )
 
         await status_msg.edit_text(
             f"📥 <b>{escape_html(title)}</b>\n"
@@ -440,12 +563,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         # ── Step 2: Download audio with yt-dlp (with progress) ──
+        _active_downloads[user_id]["stage"] = "downloading"
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         source_template = os.path.join(
             DOWNLOAD_DIR, f"{timestamp}_{safe_title}_source.%(ext)s"
         )
 
-        # Progress tracker for yt-dlp download
         dl_progress = {"pct": 0, "speed": "", "eta": "", "finished": False}
 
         def progress_hook(d):
@@ -469,12 +592,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "extractor_args": {"youtube": {"player_client": ["android"]}},
         }
 
-        # Run download in executor to allow progress updates
         loop = asyncio.get_event_loop()
         download_future = loop.run_in_executor(None, _do_download, ydl_opts, text)
 
         last_update = 0
         while not download_future.done():
+            # Check cancel during download
+            if cancel_event.is_set():
+                # Can't easily kill executor thread, but we'll raise on next check
+                raise Exception("Download cancelled by user")
             await asyncio.sleep(2)
             pct = dl_progress["pct"]
             now_t = time.time()
@@ -511,18 +637,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not source_path or not os.path.exists(source_path):
             raise Exception("Source file not found after download")
 
-        # Track files for /cancel cleanup
         _active_downloads[user_id]["files"] = [source_path]
+        logger.info(f"yt-dlp download complete: user={user_id}, video_id={video_id}, source={source_path}")
 
-        # ── Step 3: Download thumbnail for cover art ──
+        # ── Step 3: Download thumbnail (in executor) ──
         thumb_path = None
         if thumbnail_url:
             try:
                 thumb_path = os.path.join(DOWNLOAD_DIR, f"{timestamp}_{safe_title}_thumb.jpg")
-                urllib.request.urlretrieve(thumbnail_url, thumb_path)
-                # Verify it's a valid image
+                await loop.run_in_executor(None, urllib.request.urlretrieve, thumbnail_url, thumb_path)
                 with Image.open(thumb_path) as img_check:
-                    img_check.verify()
+                    await loop.run_in_executor(None, img_check.verify)
                 logger.info(f"Thumbnail downloaded: {thumb_path}")
             except Exception as e:
                 logger.warning(f"Failed to download thumbnail: {e}")
@@ -533,18 +658,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         pass
                 thumb_path = None
 
-        # ── Step 4: Convert to ultra-compressed Opus (throttled) ──
+        # ── Step 4: Convert to Opus ──
+        _active_downloads[user_id]["stage"] = "converting"
         output_filename = f"{timestamp}_{safe_title}.opus"
         output_path = os.path.join(DOWNLOAD_DIR, output_filename)
 
-        # Track files for /cancel
         files = _active_downloads[user_id].get("files", [])
         if thumb_path:
             files.append(thumb_path)
         files.append(output_path)
         _active_downloads[user_id]["files"] = files
 
-        # Build metadata
         meta = {
             "title": title,
             "artist": uploader,
@@ -556,53 +680,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for k, v in meta.items():
             metadata_args += ["-metadata", f"{k}={v}"]
 
-        # Base ffmpeg command (throttling wrappers added by run_ffmpeg_with_progress)
-        ffmpeg_cmd = [
-            "ffmpeg",
-            "-i", source_path,
-        ]
-        ffmpeg_cmd += [
-            "-ac", "1",
-            "-ar", "16000",
-            "-c:a", "libopus",
-            "-b:a", "12k",
-            "-application", "voip",
-            "-threads", "1",
-            "-map_metadata", "-1",
+        ffmpeg_cmd = ["ffmpeg", "-i", source_path] + [
+            "-ac", "1", "-ar", "16000", "-c:a", "libopus", "-b:a", "12k",
+            "-application", "voip", "-threads", "1", "-map_metadata", "-1",
             "-progress", "pipe:1",
         ] + metadata_args + ["-y", output_path]
+
+        logger.info(f"Starting ffmpeg: user={user_id}, video_id={video_id}, duration={format_duration(duration)}, source_size={os.path.getsize(source_path)}\n    ffmpeg cmd: {' '.join(ffmpeg_cmd[:8])}...")
 
         result_code = await run_ffmpeg_with_progress(
             ffmpeg_cmd, duration, status_msg, title, user_id=user_id
         )
 
         if result_code != 0:
-            # Check if cancelled by user
             if user_id not in _active_downloads:
                 raise Exception("Download cancelled by user")
-
-            # Fallback: try without progress pipe
-            fallback_cmd = [
-                "nice", "-n", "19",
-                "ionice", "-c", "3",
-            ] + [a for a in ffmpeg_cmd if a != "-progress" and a != "pipe:1"]
-            fallback_result = subprocess.run(
-                fallback_cmd, capture_output=True, text=True
-            )
+            fallback_cmd = ["nice", "-n", "19", "ionice", "-c", "3"] + [a for a in ffmpeg_cmd if a != "-progress" and a != "pipe:1"]
+            fallback_result = await loop.run_in_executor(None, lambda: subprocess.run(fallback_cmd, capture_output=True, text=True))
             if fallback_result.returncode != 0:
-                # Last resort: no throttling at all
                 bare_cmd = [a for a in ffmpeg_cmd if a != "-progress" and a != "pipe:1"]
-                bare_result = subprocess.run(bare_cmd, capture_output=True, text=True)
+                bare_result = await loop.run_in_executor(None, lambda: subprocess.run(bare_cmd, capture_output=True, text=True))
                 if bare_result.returncode != 0:
                     raise Exception(f"ffmpeg failed: {bare_result.stderr[:300]}")
             result_code = 0
 
-        # Embed cover art via mutagen (ffmpeg's opus muxer doesn't support attached pics)
+        # Embed cover art
         if thumb_path and os.path.exists(output_path):
             try:
                 audio = OggOpus(output_path)
                 pic = Picture()
-                pic.type = 3  # Front cover
+                pic.type = 3
                 pic.mime = "image/jpeg"
                 with open(thumb_path, "rb") as f:
                     pic.data = f.read()
@@ -610,7 +717,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pic.height = 720
                 pic.depth = 8
                 pic.colors = 0
-                # Encode as base64 per Vorbis comment spec
                 pic_data = pic.write()
                 encoded = base64.b64encode(pic_data).decode("ascii")
                 audio["metadata_block_picture"] = [encoded]
@@ -619,7 +725,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.warning(f"Failed to embed cover art: {e}")
 
-        # Clean up source and thumbnail
         try:
             os.remove(source_path)
         except OSError:
@@ -630,10 +735,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except OSError:
                 pass
 
+        logger.info(f"ffmpeg done: user={user_id}, video_id={video_id}, output={output_path}, size={format_size(os.path.getsize(output_path))}")
+
         if not os.path.exists(output_path):
             raise Exception("Output file not found after conversion")
 
-        # ── Step 4: Check size, split if needed ──
+        # ── Step 5: Check size, split if needed ──
+        _active_downloads[user_id]["stage"] = "splitting"
         file_size = os.path.getsize(output_path)
 
         if file_size > MAX_FILE_SIZE:
@@ -642,23 +750,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✂️ Файл {format_size(file_size)} — разбиваю на части…",
                 parse_mode="HTML"
             )
-
-            parts = split_audio_file(
-                output_path, MAX_FILE_SIZE,
-                f"{timestamp}_{safe_title}"
-            )
+            parts = await loop.run_in_executor(None, split_audio_file, output_path, MAX_FILE_SIZE, f"{timestamp}_{safe_title}")
+            logger.info(f"Split: {len(parts)} parts, file={format_size(file_size)}")
         else:
-            # Probe duration of single file
             probe_cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", output_path]
-            probe_r = subprocess.run(probe_cmd, capture_output=True, text=True)
+            probe_r = await loop.run_in_executor(None, lambda: subprocess.run(probe_cmd, capture_output=True, text=True))
             single_dur = float(json.loads(probe_r.stdout)["format"]["duration"])
             parts = [(output_path, 1, 1, single_dur)]
+            logger.info(f"No split needed: {format_size(file_size)}, duration={format_duration(int(single_dur))}")
 
-        # ── Step 5: Send file(s) ──
+        # ── Step 6: Send file(s) ──
+        _active_downloads[user_id]["stage"] = "sending"
         for part_path, part_num, total, part_dur in parts:
             part_size = os.path.getsize(part_path)
 
-            # Build caption with actual part duration
             caption_parts = [
                 f"<b>{escape_html(title)}</b>",
                 f"👤 {escape_html(uploader)}",
@@ -675,59 +780,84 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             caption = "\n".join(caption_parts)
 
-            # Update status before sending
             if total > 1:
                 await status_msg.edit_text(
-                    f"📤 <b>{escape_html(title)}</b>\n"
-                    f"⬆️ Отправляю часть {part_num} из {total}…",
+                    f"📤 <b>{escape_html(title)}</b>\n⬆️ Отправляю часть {part_num} из {total}…",
                     parse_mode="HTML"
                 )
             else:
                 await status_msg.edit_text(
-                    f"📤 <b>{escape_html(title)}</b>\n"
-                    f"📦 {format_size(part_size)} | ⏱ {format_duration(int(part_dur))}\n\n"
-                    f"⬆️ Отправляю…",
+                    f"📤 <b>{escape_html(title)}</b>\n📦 {format_size(part_size)} | ⏱ {format_duration(int(part_dur))}\n\n⬆️ Отправляю…",
                     parse_mode="HTML"
                 )
 
             with open(part_path, "rb") as f:
                 audio_title = f"{title[:240]} (ч.{part_num}/{total})" if total > 1 else title[:256]
                 await update.message.reply_audio(
-                    audio=f,
-                    title=audio_title,
-                    performer=uploader[:256],
-                    duration=int(part_dur),
-                    caption=caption,
-                    parse_mode="HTML",
+                    audio=f, title=audio_title, performer=uploader[:256],
+                    duration=int(part_dur), caption=caption, parse_mode="HTML",
                     reply_to_message_id=update.message.message_id
                 )
 
-            # Remove part after sending
+            logger.info(f"Sent part {part_num}/{total}: user={user_id}, size={format_size(part_size)}, dur={format_duration(int(part_dur))}")
             try:
                 os.remove(part_path)
             except OSError:
                 pass
 
+        success = True
+        _active_downloads[user_id]["stage"] = "done"
+
     except yt_dlp.utils.DownloadError as e:
-        logger.error(f"yt-dlp error: {e}")
-        await status_msg.edit_text(
-            f"❌ Не удалось скачать видео.\n"
-            f"Проверь ссылку или попробуй позже.\n\n"
-            f"<code>{escape_html(str(e)[:200])}</code>",
-            parse_mode="HTML"
-        )
+        logger.error(f"yt-dlp error: user={user_id}, video_id={video_id}, error={e}")
+        if status_msg:
+            await status_msg.edit_text(
+                f"❌ Не удалось скачать видео.\nПроверь ссылку или попробуй позже.\n\n<code>{escape_html(str(e)[:200])}</code>",
+                parse_mode="HTML"
+            )
+        success = False
     except Exception as e:
-        logger.error(f"Unexpected error: {traceback.format_exc()}")
-        await status_msg.edit_text(
-            f"❌ Ошибка: <code>{escape_html(str(e)[:200])}</code>\n\n"
-            f"Попробуй другую ссылку или повтори позже.",
-            parse_mode="HTML"
-        )
+        logger.error(f"Unexpected error: user={user_id}, video_id={video_id}, error={traceback.format_exc()}")
+        if status_msg:
+            await status_msg.edit_text(
+                f"❌ Ошибка: <code>{escape_html(str(e)[:200])}</code>\n\nПопробуй другую ссылку или повтори позже.",
+                parse_mode="HTML"
+            )
+        success = False
     finally:
-        # Clean up active download tracking
         _active_downloads.pop(user_id, None)
         _active_urls.discard(video_id)
-        await status_msg.delete()
+        if success and status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            logger.info(f"Completed OK: user={user_id}, video_id={video_id}")
+        else:
+            logger.info(f"Completed ERROR: user={user_id}, video_id={video_id}")
+        # Process next in queue
+        await _process_next_in_queue()
+
+
+async def _process_next_in_queue():
+    """Start processing the next item in the queue if any."""
+    global _queue
+    if not _queue:
+        return
+    # Wait a tiny bit for cleanup
+    await asyncio.sleep(0.5)
+    if _active_downloads:
+        return  # still busy (shouldn't happen, but safety check)
+    item = _queue.popleft()
+    logger.info(f"Processing queue: user={item['user_id']}, video_id={item['video_id']}")
+    try:
+        await item["status_msg"].edit_text("🎬 Ваша очередь подошла! Начинаю обработку…")
+    except Exception:
+        pass
+    await _start_processing(
+        item["update"], item["context"],
+        item["url"], item["user_id"], item["video_id"]
+    )
 
 
 # ═══════════════════════════════════════════
@@ -741,7 +871,7 @@ def main():
 
     cleanup_old_files()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
