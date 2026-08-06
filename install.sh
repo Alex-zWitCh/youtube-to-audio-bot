@@ -65,6 +65,14 @@ if [[ -z "$BOT_TOKEN" ]]; then
     fi
 fi
 
+# Get admin Telegram ID (optional, for /stats and VIP priority)
+ADMIN_ID="${2:-}"
+if [[ -z "$ADMIN_ID" ]]; then
+    echo -n "Enter your Telegram user ID for admin access (optional, press Enter to skip): "
+    read -r ADMIN_ID
+    echo ""
+fi
+
 # ── Step 1: System packages ──
 info "Installing system packages..."
 apt-get update -qq
@@ -120,6 +128,12 @@ Type=simple
 User=root
 WorkingDirectory=$BOT_DIR
 Environment="YT_AUDIO_BOT_TOKEN=$BOT_TOKEN"
+$( [[ -n "$ADMIN_ID" ]] && echo "Environment=\"YT_AUDIO_ADMIN_ID=$ADMIN_ID\""
+ [[ -n "$ADMIN_ID" ]] && echo "Environment=\"YT_AUDIO_VIP_USERS=$ADMIN_ID\"" )
+Environment="YT_AUDIO_COOKIES=$BOT_DIR/cookies.txt"
+Environment="YTDLP_PATH=$VENV_DIR/bin/yt-dlp"
+Environment="YT_AUDIO_COOKIES_REMIND_DAYS=14"
+Environment="YT_AUDIO_DB=$BOT_DIR/bot.db"
 Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.deno/bin"
 ExecStart=$VENV_DIR/bin/python3 $BOT_DIR/bot.py
 Restart=on-failure
@@ -156,10 +170,19 @@ if systemctl is-active --quiet "$SERVICE_NAME"; then
     echo "  │  Logs:     journalctl -u $SERVICE_NAME -f    │"
     echo "  │  Restart:  systemctl restart $SERVICE_NAME   │"
     echo "  │                                              │"
+    echo "  │  Cookies (required for YouTube):             │"
+    echo "  │  1. Export from Chrome:                      │"
+    echo "  │     yt-dlp --cookies-from-browser chrome \\   │"
+    echo "  │       -o /dev/null --cookies cookies.txt \\   │"
+    echo "  │       https://youtu.be/dQw4w9WgXcQ           │"
+    echo "  │  2. Upload: scp cookies.txt \\               │"
+    echo "  │     root@SERVER:$BOT_DIR/cookies.txt  │"
+    echo "  │  3. Restart: systemctl restart $SERVICE_NAME │"
+    echo "  │                                              │"
     echo "  │  BotFather setup:                            │"
     echo "  │  1. /setdescription → paste description      │"
     echo "  │  2. /setuserpic → upload bot_icon.png        │"
-    echo "  │  3. /setcommands → start, help               │"
+    echo "  │  3. /setcommands → start, help, cancel       │"
     echo "  └──────────────────────────────────────────────┘"
     echo ""
 else

@@ -4,3 +4,12 @@ __pycache__/
 venv/
 .env
 *.log
+
+# Secrets & runtime data — never commit these
+cookies.txt
+*.cookies
+bot.db
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3

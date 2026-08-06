@@ -24,6 +24,7 @@ import math
 import json
 import html
 import logging
+import sqlite3
 import asyncio
 import threading
 import subprocess
@@ -31,7 +32,7 @@ import traceback
 import urllib.request
 import concurrent.futures
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from logging.handlers import RotatingFileHandler
 from collections import deque
 
@@ -52,7 +53,14 @@ DOWNLOAD_DIR = "/tmp/yt-audio-downloads"
 MAX_FILE_SIZE = 45 * 1024 * 1024  # 45 MB safety margin
 CLEANUP_AGE = 3600  # 1 hour
 MAX_QUEUE_SIZE = 5  # max waiting users (anti-DDoS)
+ADMIN_ID = int(os.environ.get("YT_AUDIO_ADMIN_ID", "0") or "0")  # bot admin (privileged user)
+COOKIES_REMIND_DAYS = int(os.environ.get("YT_AUDIO_COOKIES_REMIND_DAYS", "14"))  # remind to refresh cookies after N days
 VIP_USERS = set(filter(None, os.environ.get("YT_AUDIO_VIP_USERS", "").split(",")))
+if ADMIN_ID:
+    VIP_USERS.add(str(ADMIN_ID))  # admin is always a VIP user
+COOKIES_FILE = os.environ.get("YT_AUDIO_COOKIES", "/opt/yt-audio-bot/cookies.txt")
+YTDLP_PATH = os.environ.get("YTDLP_PATH", "/opt/yt-audio-bot/venv/bin/yt-dlp")
+DB_PATH = os.environ.get("YT_AUDIO_DB", "/opt/yt-audio-bot/bot.db")
 LOG_DIR = "/var/log/yt-audio-bot"
 LOG_MAX_SIZE = 1 * 1024 * 1024  # 1 MB per file
 LOG_BACKUP_COUNT = 3  # 3 files max = ~3 MB total
@@ -77,6 +85,143 @@ logging.basicConfig(level=logging.INFO, handlers=[file_handler, console_handler]
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+# ═══════════════════════════════════════════
+# SQLite database (cache + usage stats)
+# ═══════════════════════════════════════════
+
+def _db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    """Create tables if they don't exist."""
+    conn = _db_connect()
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS cached_files (
+                video_id     TEXT PRIMARY KEY,
+                file_id      TEXT,
+                parts_json   TEXT,              -- JSON array of file_ids when split into parts
+                title        TEXT,
+                uploader     TEXT,
+                duration     INTEGER DEFAULT 0,
+                description  TEXT DEFAULT '',
+                webpage_url  TEXT DEFAULT '',
+                created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS downloads (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER,
+                video_id   TEXT,
+                title      TEXT,
+                cached     INTEGER DEFAULT 0,   -- 1 = served from cache, 0 = downloaded fresh
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+        logger.info("Database initialized")
+    finally:
+        conn.close()
+
+
+def get_cached_file(video_id: str):
+    """Return cached file row or None."""
+    conn = _db_connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM cached_files WHERE video_id = ?", (video_id,)
+        ).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE cached_files SET last_used_at = CURRENT_TIMESTAMP WHERE video_id = ?",
+                (video_id,)
+            )
+            conn.commit()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def save_cached_file(video_id, file_id, parts, title, uploader, duration, description, webpage_url):
+    """Save/update cached file. parts = list of file_ids (may be single-element)."""
+    conn = _db_connect()
+    try:
+        conn.execute("""
+            INSERT INTO cached_files
+                (video_id, file_id, parts_json, title, uploader, duration, description, webpage_url, last_used_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(video_id) DO UPDATE SET
+                file_id = excluded.file_id,
+                parts_json = excluded.parts_json,
+                title = excluded.title,
+                uploader = excluded.uploader,
+                duration = excluded.duration,
+                description = excluded.description,
+                webpage_url = excluded.webpage_url,
+                last_used_at = CURRENT_TIMESTAMP
+        """, (video_id, file_id, json.dumps(parts), title, uploader, duration, description, webpage_url))
+        conn.commit()
+        logger.info(f"Cache saved: video_id={video_id}, parts={len(parts)}")
+    finally:
+        conn.close()
+
+
+def delete_cached_file(video_id: str):
+    """Remove a cached file (e.g. when file_id is stale)."""
+    conn = _db_connect()
+    try:
+        conn.execute("DELETE FROM cached_files WHERE video_id = ?", (video_id,))
+        conn.commit()
+        logger.info(f"Cache removed: video_id={video_id}")
+    finally:
+        conn.close()
+
+
+def log_download(user_id: int, video_id: str, title: str, cached: bool):
+    """Record a download for usage stats."""
+    conn = _db_connect()
+    try:
+        conn.execute(
+            "INSERT INTO downloads (user_id, video_id, title, cached) VALUES (?, ?, ?, ?)",
+            (user_id, video_id, title, 1 if cached else 0)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_stats() -> dict:
+    """Aggregate usage statistics."""
+    conn = _db_connect()
+    try:
+        total = conn.execute("SELECT COUNT(*) AS c FROM downloads").fetchone()["c"]
+        cached = conn.execute("SELECT COUNT(*) AS c FROM downloads WHERE cached = 1").fetchone()["c"]
+        fresh = total - cached
+        unique_users = conn.execute("SELECT COUNT(DISTINCT user_id) AS c FROM downloads").fetchone()["c"]
+        unique_videos = conn.execute("SELECT COUNT(DISTINCT video_id) AS c FROM downloads").fetchone()["c"]
+        top = conn.execute("""
+            SELECT title, video_id, COUNT(*) AS cnt
+            FROM downloads
+            GROUP BY video_id
+            ORDER BY cnt DESC
+            LIMIT 10
+        """).fetchall()
+        return {
+            "total": total,
+            "cached": cached,
+            "fresh": fresh,
+            "unique_users": unique_users,
+            "unique_videos": unique_videos,
+            "top": [dict(r) for r in top],
+        }
+    finally:
+        conn.close()
 
 # ── Queue system ──
 # _active_downloads[user_id] = {url, video_id, proc, files, stage, status_msg, cancel_event}
@@ -152,15 +297,68 @@ def cleanup_old_files():
 
 
 def _do_download(ydl_opts: dict, url: str) -> dict:
-    """Run yt-dlp download in a separate thread (for executor)."""
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=True)
+    """Run yt-dlp download via CLI (more reliable than Python API)."""
+    errors = []
+    for client in ("web", "android"):
+        cmd = [YTDLP_PATH, "--no-warnings", "--ignore-no-formats-error",
+               "--extractor-args", f"youtube:player_client={client}"]
+        fmt = ydl_opts.get("format", "worstaudio/worst")
+        cmd += ["--format", fmt]
+        outtmpl = ydl_opts.get("outtmpl", "%(title)s.%(ext)s")
+        cmd += ["--output", outtmpl]
+        if ydl_opts.get("cookiefile"):
+            cmd += ["--cookies", ydl_opts["cookiefile"]]
+        cmd += [url]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if r.returncode == 0:
+            # Find the downloaded file via glob
+            outdir = os.path.dirname(outtmpl)
+            base = os.path.basename(outtmpl)
+            glob_pattern = re.sub(r"%\([^)]+\)[a-zA-Z]*", "*", base)
+            glob_path = os.path.join(outdir, glob_pattern)
+            candidates = sorted(glob.glob(glob_path), key=os.path.getmtime, reverse=True)
+            if candidates:
+                fp = candidates[0]
+                return {"filepath": fp, "ext": os.path.splitext(fp)[1].lstrip(".")}
+            # Download succeeded but file not found — record and try next
+            errors.append(f"[{client}] download OK but file not found: {glob_path}")
+        else:
+            err_txt = (r.stderr or "").strip()[:300]
+            errors.append(f"[{client}] rc={r.returncode}. {err_txt}")
+    # All clients failed — combine all error details for diagnostics
+    error_msg = " | ".join(errors) if errors else "Unknown error"
+    raise yt_dlp.utils.DownloadError(error_msg)
 
 
 def _do_extract_info(ydl_opts: dict, url: str) -> dict:
-    """Run yt-dlp info extraction in executor (non-blocking)."""
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=False)
+    """Run yt-dlp info extraction via CLI (more reliable format detection)."""
+    errors = []
+    for client in ("web", "android"):
+        cmd = [YTDLP_PATH, "--dump-json", "--no-warnings", "--ignore-no-formats-error",
+               "--extractor-args", f"youtube:player_client={client}"]
+        if ydl_opts.get("cookiefile"):
+            cmd += ["--cookies", ydl_opts["cookiefile"]]
+        cmd += [url]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if r.returncode == 0:
+            info = json.loads(r.stdout)
+            formats = info.get("formats") or []
+            has_media = any(
+                f.get("acodec", "none") not in ("none", None)
+                or f.get("vcodec", "none") not in ("none", None)
+                for f in formats
+            )
+            if has_media:
+                return info
+            # No media formats — record and try next client
+            err_txt = (r.stderr or "").strip()[:300]
+            errors.append(f"[{client}] no media formats ({len(formats)} formats). {err_txt}")
+        else:
+            err_txt = (r.stderr or "").strip()[:300]
+            errors.append(f"[{client}] rc={r.returncode}. {err_txt}")
+    # All clients failed — combine all error details for diagnostics
+    error_msg = " | ".join(errors) if errors else "Unknown error"
+    raise yt_dlp.utils.DownloadError(error_msg)
 
 
 async def run_ffmpeg_with_progress(
@@ -357,6 +555,43 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show usage statistics (admin only)."""
+    user_id = update.effective_user.id
+    if str(user_id) != str(ADMIN_ID):
+        await update.message.reply_text(
+            "⛔ Команда доступна только администратору.",
+            reply_to_message_id=update.message.message_id
+        )
+        return
+    try:
+        stats = get_stats()
+        lines = [
+            "📊 <b>Статистика использования</b>\n",
+            f"👥 Всего пользователей: <b>{stats['unique_users']}</b>",
+            f"🎬 Уникальных видео: <b>{stats['unique_videos']}</b>",
+            f"⬇️ Всего загрузок: <b>{stats['total']}</b>",
+            f"⚡ Из кэша: <b>{stats['cached']}</b> ({round(stats['cached'] / stats['total'] * 100) if stats['total'] else 0}%)",
+            f"🔄 Свежих: <b>{stats['fresh']}</b>",
+        ]
+        if stats["top"]:
+            lines.append("\n🏆 <b>Топ видео:</b>")
+            for i, v in enumerate(stats["top"][:10], 1):
+                lines.append(
+                    f"{i}. {escape_html((v['title'] or '?')[:40])} — <b>{v['cnt']}</b>"
+                )
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode="HTML",
+            reply_to_message_id=update.message.message_id
+        )
+    except Exception as e:
+        logger.error(f"Stats error: {traceback.format_exc()}")
+        await update.message.reply_text(
+            f"❌ Ошибка получения статистики: {escape_html(str(e)[:100])}",
+            reply_to_message_id=update.message.message_id
+        )
+
+
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel current download or remove from queue."""
     user_id = update.effective_user.id
@@ -421,6 +656,70 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _process_next_in_queue()
 
 
+async def _try_send_cached(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, video_id: str, user_id: int) -> bool:
+    """
+    Try to serve the audio from the Telegram cloud cache (file_id).
+    Returns True if served from cache, False if not cached / needs fresh download.
+    """
+    row = get_cached_file(video_id)
+    if not row or not (row.get("file_id") or row.get("parts_json")):
+        return False
+
+    title = row.get("title") or "Unknown"
+    uploader = row.get("uploader") or "Unknown"
+    duration = int(row.get("duration") or 0)
+    description = (row.get("description") or "")[:200]
+    webpage_url = row.get("webpage_url") or text
+    duration_str = format_duration(duration)
+    short_desc = description[:200] + ("…" if len(description) > 200 else "")
+
+    parts = []
+    try:
+        parts = json.loads(row["parts_json"]) if row.get("parts_json") else ([row["file_id"]] if row.get("file_id") else [])
+    except Exception:
+        parts = [row["file_id"]] if row.get("file_id") else []
+    if not parts:
+        return False
+
+    status_msg = await update.message.reply_text("⚡ Нашёл в кэше, отправляю…")
+    try:
+        for i, fid in enumerate(parts):
+            part_num = i + 1
+            total = len(parts)
+            caption_parts = [
+                f"<b>{escape_html(title)}</b>",
+                f"👤 {escape_html(uploader)}",
+                f"⏱ {duration_str}",
+            ]
+            if total > 1:
+                caption_parts.append(f"📦 Часть {part_num} из {total} (кэш)")
+            else:
+                caption_parts.append(f"📦 Из кэша | Opus 12kbps")
+            if short_desc and part_num == 1:
+                caption_parts.append(f"\n{escape_html(short_desc)}")
+                caption_parts.append(f"\n🔗 {webpage_url}")
+            caption = "\n".join(caption_parts)
+            audio_title = f"{title[:240]} (ч.{part_num}/{total})" if total > 1 else title[:256]
+            await update.message.reply_audio(
+                audio=fid, title=audio_title, performer=uploader[:256],
+                duration=duration, caption=caption, parse_mode="HTML",
+                reply_to_message_id=update.message.message_id
+            )
+        await status_msg.delete()
+        log_download(user_id, video_id, title, cached=True)
+        logger.info(f"Cache hit: user={user_id}, video_id={video_id}, parts={len(parts)}")
+        return True
+    except Exception as e:
+        # file_id likely stale — drop from cache and let fresh download happen
+        logger.warning(f"Cache miss (stale file_id): video_id={video_id}, error={e}")
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        delete_cached_file(video_id)
+        return False
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
@@ -443,6 +742,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     vid_match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', text)
     video_id = vid_match.group(1) if vid_match else text
     user_id = update.effective_user.id
+
+    # Try serving from cache (fast path — no download/conversion needed)
+    try:
+        if await _try_send_cached(update, context, text, video_id, user_id):
+            return
+    except Exception as e:
+        logger.warning(f"Cache lookup failed: user={user_id}, video_id={video_id}, error={e}")
 
     global _active_downloads, _active_urls, _queue
 
@@ -540,10 +846,23 @@ async def _start_processing(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         # ── Step 1: Extract info (in executor to not block event loop) ──
         _active_downloads[user_id]["stage"] = "extracting info"
         logger.info(f"Extracting info: user={user_id}, video_id={video_id}")
-        ydl_opts_info = {"quiet": True, "no_warnings": True}
-        ydl_opts_info["extractor_args"] = {"youtube": {"player_client": ["android"]}}
+        ydl_opts_info = {}
         loop = asyncio.get_event_loop()
         info = await loop.run_in_executor(None, _do_extract_info, ydl_opts_info, text)
+
+        # Check if there are any real formats (not just storyboard/images)
+        formats = info.get("formats") or []
+        has_media = any(
+            f.get("acodec", "none") not in ("none", None)
+            or f.get("vcodec", "none") not in ("none", None)
+            for f in formats
+        )
+        if not has_media:
+            raise Exception(
+                "Это видео не имеет доступных для скачивания аудио/видео дорожек. "
+                "Возможно, видео ещё обрабатывается YouTube или недоступно."
+            )
+
         title = info.get("title", "Unknown")
         uploader = info.get("uploader", "Unknown")
         duration = info.get("duration", 0)
@@ -561,7 +880,7 @@ async def _start_processing(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         safe_title = sanitize(title, 120)
 
         # ── Check disk space for the source file ──
-        source_size_mb = info.get("filesize", 0) / 1024 / 1024
+        source_size_mb = (info.get("filesize") or 0) / 1024 / 1024
         if source_size_mb > 0 and source_size_mb > free_mb - 200:
             raise Exception(
                 f"Недостаточно места: файл {source_size_mb:.0f} MB, "
@@ -582,66 +901,41 @@ async def _start_processing(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             DOWNLOAD_DIR, f"{timestamp}_{safe_title}_source.%(ext)s"
         )
 
-        dl_progress = {"pct": 0, "speed": "", "eta": "", "finished": False}
-
-        def progress_hook(d):
-            if d["status"] == "downloading":
-                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                downloaded = d.get("downloaded_bytes", 0)
-                if total > 0:
-                    dl_progress["pct"] = downloaded / total * 100
-                    dl_progress["speed"] = d.get("_speed_str", "")
-                    dl_progress["eta"] = d.get("_eta_str", "")
-            elif d["status"] == "finished":
-                dl_progress["finished"] = True
-                dl_progress["pct"] = 100
-
         ydl_opts = {
-            "format": "worst",
+            "format": "worstaudio/worst",
             "outtmpl": source_template,
-            "quiet": True,
-            "no_warnings": True,
-            "progress_hooks": [progress_hook],
-            "extractor_args": {"youtube": {"player_client": ["android"]}},
+            "cookiefile": COOKIES_FILE,
         }
+        if COOKIES_FILE and not os.path.exists(COOKIES_FILE):
+            ydl_opts.pop("cookiefile", None)
 
         loop = asyncio.get_event_loop()
         download_future = loop.run_in_executor(None, _do_download, ydl_opts, text)
 
+        # Wait for download with periodic status updates
         last_update = 0
         while not download_future.done():
-            # Check cancel during download
             if cancel_event.is_set():
-                # Can't easily kill executor thread, but we'll raise on next check
                 raise Exception("Download cancelled by user")
-            await asyncio.sleep(2)
-            pct = dl_progress["pct"]
             now_t = time.time()
-            if pct > 0 and (now_t - last_update >= 5):
+            if now_t - last_update >= 5:
                 last_update = now_t
-                speed = dl_progress["speed"]
-                eta = dl_progress["eta"]
-                bar_len = 12
-                filled = int(bar_len * pct / 100)
-                bar = "▓" * filled + "░" * (bar_len - filled)
                 try:
                     await status_msg.edit_text(
                         f"📥 <b>{escape_html(title)}</b>\n"
                         f"👤 {escape_html(uploader)} | ⏱ {duration_str}\n\n"
-                        f"⬇️ Скачиваю…\n"
-                        f"{bar} {pct:.0f}%\n"
-                        f"💾 {speed} | ⏱ {eta}",
+                        f"⬇️ Скачиваю… (пожалуйста, подождите)\n"
+                        f"⏳ Это может занять до 2-3 минут",
                         parse_mode="HTML"
                     )
                 except Exception:
                     pass
+            await asyncio.sleep(2)
 
         info = await download_future
-        source_ext = info.get("ext", "webm")
-        source_path = os.path.join(
-            DOWNLOAD_DIR, f"{timestamp}_{safe_title}_source.{source_ext}"
-        )
-        if not os.path.exists(source_path):
+        source_path = info.get("filepath")
+        if not source_path or not os.path.exists(source_path):
+            # Fallback: search by timestamp pattern
             candidates = glob.glob(
                 os.path.join(DOWNLOAD_DIR, f"{timestamp}_{safe_title}_source.*")
             )
@@ -774,6 +1068,7 @@ async def _start_processing(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
         # ── Step 6: Send file(s) ──
         _active_downloads[user_id]["stage"] = "sending"
+        sent_file_ids = []
         for part_path, part_num, total, part_dur in parts:
             part_size = os.path.getsize(part_path)
 
@@ -806,17 +1101,35 @@ async def _start_processing(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
             with open(part_path, "rb") as f:
                 audio_title = f"{title[:240]} (ч.{part_num}/{total})" if total > 1 else title[:256]
-                await update.message.reply_audio(
+                sent = await update.message.reply_audio(
                     audio=f, title=audio_title, performer=uploader[:256],
                     duration=int(part_dur), caption=caption, parse_mode="HTML",
                     reply_to_message_id=update.message.message_id
                 )
+                # Collect file_id for caching (Telegram stores the file in the cloud)
+                fid = (sent.audio.file_id if sent and sent.audio else None)
+                if fid:
+                    sent_file_ids.append(fid)
 
-            logger.info(f"Sent part {part_num}/{total}: user={user_id}, size={format_size(part_size)}, dur={format_duration(int(part_dur))}")
+            logger.info(f"Sent part {part_num}/{total}: user={user_id}, size={format_size(part_size)}, dur={format_duration(int(part_dur))}, file_id={'yes' if (sent_file_ids and len(sent_file_ids) >= part_num) else 'no'}")
             try:
                 os.remove(part_path)
             except OSError:
                 pass
+
+        # ── Step 7: Save to cache + log usage ──
+        if sent_file_ids:
+            try:
+                save_cached_file(
+                    video_id, sent_file_ids[0], sent_file_ids,
+                    title, uploader, int(duration), (description or ""), webpage_url
+                )
+            except Exception as e:
+                logger.warning(f"Failed to save cache: video_id={video_id}, error={e}")
+        try:
+            log_download(user_id, video_id, title, cached=False)
+        except Exception as e:
+            logger.warning(f"Failed to log download: {e}")
 
         success = True
         _active_downloads[user_id]["stage"] = "done"
@@ -877,19 +1190,78 @@ async def _process_next_in_queue():
 # Main
 # ═══════════════════════════════════════════
 
+# Last date (YYYY-MM-DD) a cookie reminder was sent — to avoid daily spam
+_last_cookie_reminder = None
+
+
+def cookies_age_days() -> float:
+    """Return how many days old the cookies file is (0 if missing)."""
+    if not os.path.exists(COOKIES_FILE):
+        return 0.0
+    return (time.time() - os.path.getmtime(COOKIES_FILE)) / 86400.0
+
+
+async def check_cookies_job(context: ContextTypes.DEFAULT_TYPE):
+    """Daily job: notify admin if cookies file is older than COOKIES_REMIND_DAYS."""
+    global _last_cookie_reminder
+    if not ADMIN_ID:
+        return
+    age_days = cookies_age_days()
+    if not os.path.exists(COOKIES_FILE):
+        logger.warning("Cookie reminder check: cookies file not found")
+        return
+    today = datetime.now().strftime("%Y-%m-%d")
+    if age_days < COOKIES_REMIND_DAYS or _last_cookie_reminder == today:
+        return
+    _last_cookie_reminder = today
+    msg = (
+        "⚠️ <b>Пора обновить cookies для YouTube</b>\n\n"
+        f"Файл cookies не обновлялся уже <b>{int(age_days)} дней</b> "
+        f"(рекомендуется обновлять каждые {COOKIES_REMIND_DAYS} дней).\n\n"
+        "Протухшие cookies приводят к ошибкам скачивания "
+        "(«Sign in to confirm you're not a bot», «No video formats found»).\n\n"
+        "Как обновить:\n"
+        "1. На локальной машине: <code>python3 -m yt_dlp --cookies-from-browser chrome -o /dev/null --cookies /tmp/yt_cookies.txt https://youtu.be/dQw4w9WgXcQ</code>\n"
+        "2. Загрузить на сервер:\n"
+        "<code>scp /tmp/yt_cookies.txt root@rom.zwitch.ru:/opt/yt-audio-bot/cookies.txt</code>\n"
+        "3. Перезапустить бота:\n"
+        "<code>systemctl restart yt-audio-bot</code>"
+    )
+    try:
+        await context.bot.send_message(chat_id=ADMIN_ID, text=msg, parse_mode="HTML")
+        logger.info(f"Cookie reminder sent to admin {ADMIN_ID} (age={int(age_days)} days)")
+    except Exception as e:
+        logger.error(f"Failed to send cookie reminder to {ADMIN_ID}: {e}")
+
+
 def main():
     if not BOT_TOKEN:
         logger.error("❌ YT_AUDIO_BOT_TOKEN environment variable not set!")
         sys.exit(1)
 
     cleanup_old_files()
+    init_db()
 
     app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Daily job: remind admin to refresh cookies (once a day at 09:00)
+    try:
+        app.job_queue.run_daily(check_cookies_job, time=dt_time(hour=9, minute=0))
+        logger.info("Scheduled daily cookie reminder job (09:00)")
+    except Exception as e:
+        logger.warning(f"Could not schedule cookie reminder job: {e}")
+
+    # Also check once shortly after startup (in case bot was down for days)
+    try:
+        app.job_queue.run_once(check_cookies_job, when=60)
+    except Exception as e:
+        logger.warning(f"Could not schedule startup cookie check: {e}")
 
     logger.info("🤖 Bot started!")
     app.run_polling()

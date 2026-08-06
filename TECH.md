@@ -79,9 +79,20 @@ Before any download:
 | ffmpeg fallback | `run_in_executor` | subprocess.run is blocking |
 
 ## YouTube Client Strategy
-- **Primary**: `player_client=android` — bypasses JS n-challenge, works without cookies
-- **Limitation**: Android client only returns combined mp4 (format 18), no audio-only formats
-- **Result**: yt-dlp downloads `worst` format, ffmpeg extracts audio and discards video
+The bot uses **CLI `yt-dlp`** (not the Python API) because the Python API can miss formats that the CLI sees — this was the root cause of "No video formats found" errors.
+
+- **Primary**: `player_client=web` with cookies (`cookiefile`) — full format list
+- **Fallback**: if web client returns no media formats (e.g. storyboard-only), automatically retries with `player_client=android`
+- **Android client** returns combined mp4 (format 18), bypasses some n-challenge cases
+- **Result**: downloads `worstaudio/worst` format, ffmpeg extracts audio and discards video
+- Both functions (`_do_extract_info`, `_do_download`) collect per-client errors so failures show the real reason instead of "Unknown error"
+
+## Cookie Authentication
+- YouTube increasingly blocks anonymous access with "Sign in to confirm you're not a bot"
+- Cookies are loaded from `YT_AUDIO_COOKIES` (default `/opt/yt-audio-bot/cookies.txt`)
+- Export from Chrome: `python3 -m yt_dlp --cookies-from-browser chrome -o /dev/null --cookies /tmp/yt_cookies.txt https://youtu.be/dQw4w9WgXcQ`
+- Upload to server: `scp /tmp/yt_cookies.txt root@<server>:/opt/yt-audio-bot/cookies.txt` then `systemctl restart yt-audio-bot`
+- **Admin reminder**: the daily job (09:00) + startup check notify the admin when cookies are older than `YT_AUDIO_COOKIES_REMIND_DAYS` (default 14)
 
 ## Environment Variables
 
@@ -94,4 +105,30 @@ Before any download:
 | `LOG_DIR` | `/var/log/yt-audio-bot` | Log directory |
 | `LOG_MAX_SIZE` | 1 MB | Rotating log file size |
 | `LOG_BACKUP_COUNT` | 3 | Number of old log files |
+| `YT_AUDIO_ADMIN_ID` | — | Telegram user ID of bot admin. Admin is **always** treated as VIP |
 | `YT_AUDIO_VIP_USERS` | — | Comma-separated user IDs with queue priority |
+| `YT_AUDIO_COOKIES` | `/opt/yt-audio-bot/cookies.txt` | Path to YouTube cookies file |
+| `YTDLP_PATH` | `/opt/yt-audio-bot/venv/bin/yt-dlp` | Path to yt-dlp binary |
+| `YT_AUDIO_COOKIES_REMIND_DAYS` | 14 | After N days without refresh, admin gets a cookie-refresh reminder |
+| `YT_AUDIO_DB` | `/opt/yt-audio-bot/bot.db` | SQLite database (file_id cache + usage stats) |
+
+### 9. Cookie Refresh Reminder
+- **Admin** (`YT_AUDIO_ADMIN_ID`) is notified via Telegram when the cookies file is older than `YT_AUDIO_COOKIES_REMIND_DAYS` (default 14 days)
+- Checked by a daily job (09:00) + once at bot startup
+- Reminder is sent at most once per day to avoid spam
+- The reminder includes the exact commands to re-export cookies from Chrome and upload them
+
+### 10. Cloud Cache (file_id) + Usage Stats (SQLite)
+When the bot sends an audio, Telegram stores it in its cloud and returns a stable **`file_id`**. The bot saves it to a local SQLite database (`YT_AUDIO_DB`, default `/opt/yt-audio-bot/bot.db`):
+
+**`cached_files`** table — `video_id → file_id` (plus title, uploader, duration, parts):
+- On a new request, the bot first checks this table
+- If found → serves the audio **instantly** via `file_id` (no YouTube download, no ffmpeg, no CPU usage)
+- Split files (parts) are cached as a JSON array of `file_id`s
+- If a `file_id` goes stale (Telegram may invalidate after long inactivity) → bot drops the cache entry and does a fresh download
+
+**`downloads`** table — usage statistics:
+- Every request logs `user_id`, `video_id`, `title`, `cached` (0/1), timestamp
+- `/stats` command (admin only) shows: total downloads, cache hit rate, unique users/videos, top-10 videos
+
+**Benefits:** repeated requests for popular videos cost zero server resources (no re-download/re-encode); the audio lives in Telegram's cloud.

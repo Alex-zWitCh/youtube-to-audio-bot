@@ -16,17 +16,24 @@ A Telegram bot that converts YouTube videos to ultra-compressed Opus audio (12 k
 - 🔹 **Async architecture:** all blocking I/O in executors, non-blocking ffmpeg
 - 🔹 **Public bot:** no registration required, anyone can send a link
 - 🔹 **File cleanup:** files deleted after sending; cron cleans orphans
+- 🔹 **Cloud cache:** audio `file_id` saved to SQLite — repeated requests for the same video are served instantly from Telegram cloud (no re-download/re-convert)
+- 🔹 **Usage stats:** `/stats` (admin) shows downloads, cache hit rate, top videos
 
 
 ## How It Works
 
 ```
-User sends YouTube link → Bot extracts info → Downloads audio (android client)
-  → ffmpeg converts to Opus 12 kbps mono 16 kHz (nice + ionice)
-  → mutagen embeds cover art and metadata
-  → If >45 MB: splits into parts
-  → Sends file(s) via Telegram → Deletes from server
+User sends YouTube link
+  ├─ Cache hit? → serve instantly from Telegram cloud (file_id) ✅
+  └─ Cache miss → Bot extracts info (web client + cookies)
+       → Downloads audio (falls back to android client if needed)
+       → ffmpeg converts to Opus 12 kbps mono 16 kHz (nice + ionice)
+       → mutagen embeds cover art and metadata
+       → If >45 MB: splits into parts
+       → Sends file(s) via Telegram → saves file_id to cache → Deletes from server
 ```
+
+> **Cookies:** YouTube increasingly requires authentication. Export cookies from your browser and place them in `cookies.txt` (see `YT_AUDIO_COOKIES`). The admin gets a Telegram reminder every 14 days to refresh them.
 
 ## Quick Start (Self-Hosting)
 
@@ -67,7 +74,12 @@ All configuration is via environment variables (set in the systemd service file)
 | `DOWNLOAD_DIR` | `/tmp/yt-audio-downloads` | Temp directory for downloads |
 | `MAX_FILE_SIZE` | `45 MB` | Split threshold |
 | `CLEANUP_AGE` | `3600` (1 hour) | Max file age before cleanup |
+| `YT_AUDIO_ADMIN_ID` | — | Telegram user ID of the bot admin (always VIP) |
 | `YT_AUDIO_VIP_USERS` | — | Comma-separated Telegram user IDs with queue priority |
+| `YT_AUDIO_COOKIES` | `/opt/yt-audio-bot/cookies.txt` | Path to YouTube cookies file |
+| `YTDLP_PATH` | `/opt/yt-audio-bot/venv/bin/yt-dlp` | Path to the yt-dlp binary |
+| `YT_AUDIO_COOKIES_REMIND_DAYS` | `14` | Admin gets a cookie-refresh reminder after this many days |
+| `YT_AUDIO_DB` | `/opt/yt-audio-bot/bot.db` | Path to the SQLite database (cache + usage stats) |
 
 ## BotFather Setup
 
@@ -81,7 +93,7 @@ After starting the bot, configure it via [@BotFather](https://t.me/BotFather):
 ```
 /setdescription  →  paste description text
 /setabouttext    →  🎧 YouTube → Audio Bot — ultra-compressed Opus 12 kbps
-/setcommands     →  start — Start the bot\nhelp — Show help
+/setcommands     →  start — Start the bot\nhelp — Show help\ncancel — Cancel current task\nstats — Usage statistics (admin)
 /setuserpic      →  upload bot_icon.png
 ```
 
@@ -102,7 +114,7 @@ youtube-to-audio-bot/
 
 ### Audio Encoding Pipeline
 
-1. **yt-dlp** (android client) downloads combined mp4 (`worst` format, no cookies needed)
+1. **yt-dlp** (CLI, `web` client + cookies, falls back to `android`) downloads audio (`worstaudio/worst` format)
 2. **ffmpeg** converts with:
    - Codec: libopus (speech-optimized `-application voip`)
    - Bitrate: 12 kbps
@@ -111,6 +123,7 @@ youtube-to-audio-bot/
    - Threads: 1
 3. **mutagen** embeds YouTube thumbnail as cover art
 4. If output > 45 MB: **ffmpeg** splits by duration using stream copy
+5. Telegram stores the audio in its cloud; the returned **`file_id`** is saved to SQLite for instant reuse
 
 ### CPU Throttling
 
@@ -184,16 +197,24 @@ Telegram-бот, который конвертирует YouTube-видео в �
 - 🔹 **Индикатор прогресса:** скорость скачивания + прогресс конвертации с ETA
 - 🔹 **Публичный бот:** регистрация не требуется
 - 🔹 **Очистка:** файлы удаляются сразу после отправки; cron чистит остатки каждый час
+- 🔹 **Облачный кэш:** `file_id` сохраняется в SQLite — повторные запросы того же видео отдаются мгновенно из облака Telegram (без скачивания и конвертации)
+- 🔹 **Статистика:** `/stats` (для админа) — загрузки, % кэш-попаданий, топ видео
+- 🔹 **Напоминание о cookies:** админ получает уведомление раз в 14 дней, когда пора обновить куки
 
 ### Как это работает
 
 ```
-Пользователь отправляет ссылку → Бот получает инфо → Скачивает аудио (android)
-  → ffmpeg конвертирует в Opus 12 kbps моно 16 кГц (nice + ionice)
-  → mutagen встраивает обложку и метаданные
-  → Если >45 МБ: разбивает на части
-  → Отправляет файл(ы) через Telegram → Удаляет с сервера
+Пользователь отправляет ссылку
+  ├─ Есть в кэше? → мгновенно отдаёт из облака Telegram (file_id) ✅
+  └─ Нет в кэше → Бот получает инфо (web client + cookies)
+       → Скачивает аудио (fallback на android при необходимости)
+       → ffmpeg конвертирует в Opus 12 kbps моно 16 кГц (nice + ionice)
+       → mutagen встраивает обложку и метаданные
+       → Если >45 МБ: разбивает на части
+       → Отправляет файл(ы) → сохраняет file_id в кэш → Удаляет с сервера
 ```
+
+> **Cookies:** YouTube требует авторизации. Экспортируйте куки из браузера в `cookies.txt` (см. `YT_AUDIO_COOKIES`). Админ получает напоминание каждые 14 дней о необходимости обновления.
 
 ### Быстрая установка
 

@@ -8,6 +8,12 @@ Type=simple
 User=root
 WorkingDirectory=/opt/yt-audio-bot
 Environment="YT_AUDIO_BOT_TOKEN=your_bot_token_from_botfather"
+Environment="YT_AUDIO_ADMIN_ID=your_telegram_user_id"
+Environment="YT_AUDIO_VIP_USERS=your_telegram_user_id"
+Environment="YT_AUDIO_COOKIES=/opt/yt-audio-bot/cookies.txt"
+Environment="YTDLP_PATH=/opt/yt-audio-bot/venv/bin/yt-dlp"
+Environment="YT_AUDIO_COOKIES_REMIND_DAYS=14"
+Environment="YT_AUDIO_DB=/opt/yt-audio-bot/bot.db"
 Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.deno/bin"
 ExecStart=/opt/yt-audio-bot/venv/bin/python3 /opt/yt-audio-bot/bot.py
 Restart=on-failure
