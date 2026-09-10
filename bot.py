@@ -41,8 +41,9 @@ from PIL import Image
 import base64
 from mutagen.oggopus import OggOpus
 from mutagen.flac import Picture
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.request import HTTPXRequest
 
 # ═══════════════════════════════════════════
 # Configuration
@@ -124,6 +125,22 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS audio_ratings (
+                user_id     INTEGER NOT NULL,
+                video_id    TEXT NOT NULL,
+                rating      INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+                title       TEXT NOT NULL,
+                uploader    TEXT DEFAULT '',
+                webpage_url TEXT DEFAULT '',
+                rated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, video_id)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_audio_ratings_user_rating
+            ON audio_ratings (user_id, rating DESC, rated_at DESC)
+        """)
         conn.commit()
         logger.info("Database initialized")
     finally:
@@ -192,6 +209,67 @@ def log_download(user_id: int, video_id: str, title: str, cached: bool):
             (user_id, video_id, title, 1 if cached else 0)
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def save_rating(user_id: int, video_id: str, rating: int, title: str, uploader: str, webpage_url: str):
+    """Save a user's rating for a video, replacing their previous rating."""
+    conn = _db_connect()
+    try:
+        conn.execute("""
+            INSERT INTO audio_ratings (user_id, video_id, rating, title, uploader, webpage_url, rated_at)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id, video_id) DO UPDATE SET
+                rating = excluded.rating,
+                title = excluded.title,
+                uploader = excluded.uploader,
+                webpage_url = excluded.webpage_url,
+                rated_at = CURRENT_TIMESTAMP
+        """, (user_id, video_id, rating, title, uploader, webpage_url))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_rating(user_id: int, video_id: str) -> int | None:
+    """Return a user's rating for a video, if one exists."""
+    conn = _db_connect()
+    try:
+        row = conn.execute(
+            "SELECT rating FROM audio_ratings WHERE user_id = ? AND video_id = ?",
+            (user_id, video_id),
+        ).fetchone()
+        return row["rating"] if row else None
+    finally:
+        conn.close()
+
+
+def delete_rating(user_id: int, video_id: str):
+    """Remove a user's rating for a video."""
+    conn = _db_connect()
+    try:
+        conn.execute(
+            "DELETE FROM audio_ratings WHERE user_id = ? AND video_id = ?",
+            (user_id, video_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_rated_audio(user_id: int, limit: int = 30) -> list[dict]:
+    """Return a user's rated audio ordered by rating and most recent update."""
+    conn = _db_connect()
+    try:
+        rows = conn.execute("""
+            SELECT video_id, rating, title, uploader, webpage_url, rated_at
+            FROM audio_ratings
+            WHERE user_id = ?
+            ORDER BY rating DESC, rated_at DESC
+            LIMIT ?
+        """, (user_id, limit)).fetchall()
+        return [dict(row) for row in rows]
     finally:
         conn.close()
 
@@ -278,8 +356,10 @@ def cleanup_old_files():
     removed = 0
     for f in glob.glob(os.path.join(DOWNLOAD_DIR, "*")):
         if os.path.isfile(f):
-            # Always remove yt-dlp .part temp files (residue from failed downloads)
-            if f.endswith(".part"):
+            age = now - os.path.getmtime(f)
+            # A current yt-dlp download writes a .part file. Only remove stale
+            # residues so another incoming update cannot cancel it mid-download.
+            if f.endswith(".part") and age > 15 * 60:
                 try:
                     os.remove(f)
                     removed += 1
@@ -288,7 +368,6 @@ def cleanup_old_files():
                     pass
                 continue
             # Remove old files past cleanup age
-            age = now - os.path.getmtime(f)
             if age > CLEANUP_AGE:
                 os.remove(f)
                 removed += 1
@@ -510,6 +589,48 @@ def split_audio_file(file_path: str, max_size: int, base_name: str) -> list:
 # Telegram Handlers
 # ═══════════════════════════════════════════
 
+def rating_keyboard(video_id: str, selected: int | None = None) -> InlineKeyboardMarkup:
+    buttons = []
+    for rating in range(1, 6):
+        label = f"✓ {rating}" if rating == selected else str(rating)
+        buttons.append(InlineKeyboardButton(label, callback_data=f"rate:{video_id}:{rating}"))
+    return InlineKeyboardMarkup([buttons])
+
+
+async def handle_rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+
+    match = re.fullmatch(r"rate:([A-Za-z0-9_-]{11}):([1-5])", query.data or "")
+    if not match:
+        await query.answer("Некорректная оценка.", show_alert=True)
+        return
+
+    video_id, rating_text = match.groups()
+    rating = int(rating_text)
+    row = get_cached_file(video_id)
+    audio = query.message.audio if query.message else None
+    title = (row or {}).get("title") or (audio.title if audio else None) or "Без названия"
+    uploader = (row or {}).get("uploader") or (audio.performer if audio else None) or ""
+    webpage_url = (row or {}).get("webpage_url") or f"https://www.youtube.com/watch?v={video_id}"
+
+    try:
+        if get_rating(query.from_user.id, video_id) == rating:
+            delete_rating(query.from_user.id, video_id)
+            await query.answer("Оценка снята")
+            await query.edit_message_reply_markup(reply_markup=rating_keyboard(video_id))
+            logger.info(f"Rating removed: user={query.from_user.id}, video_id={video_id}")
+            return
+        save_rating(query.from_user.id, video_id, rating, title, uploader, webpage_url)
+        await query.answer(f"Оценка: {rating}/5")
+        await query.edit_message_reply_markup(reply_markup=rating_keyboard(video_id, rating))
+        logger.info(f"Rating saved: user={query.from_user.id}, video_id={video_id}, rating={rating}")
+    except Exception:
+        logger.error(f"Rating save failed: {traceback.format_exc()}")
+        await query.answer("Не удалось сохранить оценку. Попробуйте ещё раз.", show_alert=True)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🎧 <b>YouTube → Audio Bot</b>\n\n"
@@ -524,7 +645,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📋 <b>Команды:</b>\n"
         "  /start — показать это сообщение\n"
         "  /help — справка и команды\n"
-        "  /cancel — отменить текущую загрузку",
+        "  /cancel — отменить текущую загрузку\n"
+        "  /rated — мои оценённые аудио",
         parse_mode="HTML",
         disable_web_page_preview=True
     )
@@ -545,7 +667,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Команды:</b>\n"
         "  /start — приветствие и информация\n"
         "  /help — эта справка\n"
-        "  /cancel — отменить текущую загрузку\n\n"
+        "  /cancel — отменить текущую загрузку\n"
+        "  /rated — мои оценённые аудио\n\n"
         "<b>Формат на выходе:</b> Opus 12kbps, моно, 16 кГц\n"
         "<b>Ограничение:</b> до 50 МБ (с авто-сплитом)\n\n"
         "⚡ Процесс конвертации имеет низкий приоритет\n"
@@ -590,6 +713,30 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"❌ Ошибка получения статистики: {escape_html(str(e)[:100])}",
             reply_to_message_id=update.message.message_id
         )
+
+
+async def cmd_rated(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the calling user's rated audio."""
+    try:
+        ratings = get_rated_audio(update.effective_user.id)
+        if not ratings:
+            text = "⭐ Пока нет оценённых аудио. Поставьте оценку кнопками под аудиофайлом."
+        else:
+            lines = ["⭐ <b>Мои оценённые аудио</b>\n"]
+            for index, item in enumerate(ratings, 1):
+                title = escape_html((item["title"] or "Без названия")[:120])
+                uploader = escape_html((item["uploader"] or "")[:80])
+                line = f"{index}. <b>{item['rating']}/5</b> {title}"
+                if uploader:
+                    line += f"\n   👤 {uploader}"
+                if item["webpage_url"]:
+                    line += f"\n   🔗 {escape_html(item['webpage_url'])}"
+                lines.append(line)
+            text = "\n".join(lines)
+        await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception:
+        logger.error(f"Rated list failed: {traceback.format_exc()}")
+        await update.message.reply_text("❌ Не удалось получить оценки. Попробуйте позже.")
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -703,6 +850,7 @@ async def _try_send_cached(update: Update, context: ContextTypes.DEFAULT_TYPE, t
             await update.message.reply_audio(
                 audio=fid, title=audio_title, performer=uploader[:256],
                 duration=duration, caption=caption, parse_mode="HTML",
+                reply_markup=rating_keyboard(video_id) if part_num == total else None,
                 reply_to_message_id=update.message.message_id
             )
         await status_msg.delete()
@@ -1069,6 +1217,7 @@ async def _start_processing(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         # ── Step 6: Send file(s) ──
         _active_downloads[user_id]["stage"] = "sending"
         sent_file_ids = []
+        send_failures = []
         for part_path, part_num, total, part_dur in parts:
             part_size = os.path.getsize(part_path)
 
@@ -1099,17 +1248,58 @@ async def _start_processing(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                     parse_mode="HTML"
                 )
 
-            with open(part_path, "rb") as f:
-                audio_title = f"{title[:240]} (ч.{part_num}/{total})" if total > 1 else title[:256]
-                sent = await update.message.reply_audio(
-                    audio=f, title=audio_title, performer=uploader[:256],
-                    duration=int(part_dur), caption=caption, parse_mode="HTML",
-                    reply_to_message_id=update.message.message_id
-                )
-                # Collect file_id for caching (Telegram stores the file in the cloud)
-                fid = (sent.audio.file_id if sent and sent.audio else None)
-                if fid:
-                    sent_file_ids.append(fid)
+            audio_title = f"{title[:240]} (ч.{part_num}/{total})" if total > 1 else title[:256]
+            reply_markup = rating_keyboard(video_id) if part_num == total else None
+            sent = None
+            last_err = None
+            for attempt in range(2):
+                try:
+                    with open(part_path, "rb") as f:
+                        sent = await update.message.reply_audio(
+                            audio=f, title=audio_title, performer=uploader[:256],
+                            duration=int(part_dur), caption=caption, parse_mode="HTML",
+                            reply_markup=reply_markup,
+                            reply_to_message_id=update.message.message_id
+                        )
+                    break
+                except Exception as e:
+                    last_err = e
+                    logger.error(f"Send part {part_num}/{total} attempt {attempt + 1}/2 failed: user={user_id}, error={type(e).__name__}: {e}")
+                    await asyncio.sleep(2)
+
+            if sent is None:
+                if last_err is not None and "VOICE_MESSAGES_FORBIDDEN" in str(last_err):
+                    try:
+                        with open(part_path, "rb") as f:
+                            sent = await update.message.reply_document(
+                                document=f,
+                                filename=f"{safe_title}_part{part_num}_of_{total}.opus",
+                                caption=caption, parse_mode="HTML",
+                                reply_markup=reply_markup,
+                                reply_to_message_id=update.message.message_id
+                            )
+                    except Exception as e:
+                        last_err = e
+                        logger.error(f"Send part {part_num}/{total} document fallback failed: user={user_id}, error={type(e).__name__}: {e}")
+                if sent is None:
+                    send_failures.append(part_num)
+                    logger.error(f"Send part {part_num}/{total} FAILED: user={user_id}, error={type(last_err).__name__ if last_err else 'unknown'}: {last_err}")
+                    if status_msg:
+                        try:
+                            await status_msg.edit_text(
+                                f"⚠️ <b>{escape_html(title)}</b>\n"
+                                f"Не удалось отправить часть {part_num} из {total} (файл сохранён на сервере).\n"
+                                f"Ошибка: <code>{escape_html(str(last_err)[:120])}</code>",
+                                parse_mode="HTML"
+                            )
+                        except Exception:
+                            pass
+                    continue
+
+            # Collect file_id for caching (Telegram stores the file in the cloud)
+            fid = (sent.audio.file_id if sent and sent.audio else None)
+            if fid:
+                sent_file_ids.append(fid)
 
             logger.info(f"Sent part {part_num}/{total}: user={user_id}, size={format_size(part_size)}, dur={format_duration(int(part_dur))}, file_id={'yes' if (sent_file_ids and len(sent_file_ids) >= part_num) else 'no'}")
             try:
@@ -1117,8 +1307,23 @@ async def _start_processing(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             except OSError:
                 pass
 
+        if send_failures:
+            success = False
+            if status_msg:
+                ok_parts = [p for p in range(1, total + 1) if p not in send_failures]
+                try:
+                    await status_msg.edit_text(
+                        f"⚠️ <b>{escape_html(title)}</b>\n\n"
+                        f"Отправлено частей: {', '.join(str(p) for p in ok_parts) if ok_parts else 'нет'}\n"
+                        f"Не отправлено: {', '.join(str(p) for p in send_failures)}\n\n"
+                        f"Неотправленные файлы остались на сервере. Отправь ссылку ещё раз — они будут отправлены повторно.",
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
+
         # ── Step 7: Save to cache + log usage ──
-        if sent_file_ids:
+        if sent_file_ids and not send_failures:
             try:
                 save_cached_file(
                     video_id, sent_file_ids[0], sent_file_ids,
@@ -1242,12 +1447,18 @@ def main():
     cleanup_old_files()
     init_db()
 
-    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
+    app = Application.builder() \
+        .token(BOT_TOKEN) \
+        .concurrent_updates(True) \
+        .request(HTTPXRequest(read_timeout=300, write_timeout=300, connect_timeout=30, pool_timeout=30)) \
+        .build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("rated", cmd_rated))
+    app.add_handler(CallbackQueryHandler(handle_rating, pattern=r"^rate:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Daily job: remind admin to refresh cookies (once a day at 09:00)

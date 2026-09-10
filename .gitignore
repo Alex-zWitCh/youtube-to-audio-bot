@@ -1,15 +1,23 @@
-__pycache__/
-*.pyc
-*.pyo
-venv/
-.env
-*.log
-
-# Secrets & runtime data — never commit these
+# Runtime secrets and data
 cookies.txt
+cookies.txt.*
 *.cookies
 bot.db
+bot.db-*
 *.db
 *.db-journal
 *.sqlite
 *.sqlite3
+.env
+
+# Local runtime files
+venv/
+__pycache__/
+*.py[cod]
+*.log
+*.bak
+
+# Download artifacts
+yt-audio-downloads/
+*.part
+*.opus
