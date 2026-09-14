@@ -117,8 +117,10 @@ The bot uses **CLI `yt-dlp`** (not the Python API) because the Python API can mi
 | `YT_AUDIO_JS_RUNTIME` | `node:/usr/local/bin/node` | JS runtime passed to yt-dlp via `--js-runtimes` |
 | `YT_AUDIO_DOWNLOAD_TIMEOUT` | 1800 | Per-client download timeout (seconds) |
 | `YT_AUDIO_EXTRACT_TIMEOUT` | 300 | Per-client info-extraction timeout (seconds) |
-| `YT_AUDIO_ROUNDS` | 4 | Full retry rounds over the client list on anti-bot blocks |
-| `YT_AUDIO_ROUND_DELAY` | 15 | Delay between retry rounds (seconds) |
+| `YT_AUDIO_ROUNDS` | 3 | Full retry rounds over the client list on anti-bot blocks |
+| `YT_AUDIO_ROUND_DELAY` | 10 | Delay between retry rounds (seconds) |
+| `YT_AUDIO_PROXIES` | — | Comma-separated proxy URLs, rotated per attempt (recommended on datacenter IPs) |
+| `YT_AUDIO_PROXY` | — | Single proxy URL, used when `YT_AUDIO_PROXIES` is empty |
 
 ### 11. YouTube Anti-Bot Resilience (PO Token + retries)
 YouTube increasingly blocks datacenter IPs with *"Sign in to confirm you're not a bot"*.
@@ -132,9 +134,12 @@ The bot mitigates this with:
   after `YT_AUDIO_ROUND_DELAY` seconds, up to `YT_AUDIO_ROUNDS` times.
 - **Cookies** — fresh YouTube cookies still matter; see `COOKIES_MAC.md` for exporting them
   from a Mac browser via `tools/export_youtube_cookies_macos.sh`.
+- **Proxy** — on a datacenter IP, YouTube often bot-checks even with a PO token. Set
+  `YT_AUDIO_PROXIES` (or `YT_AUDIO_PROXY`) to route yt-dlp through a residential/mobile
+  proxy. Proxies are rotated across attempts. This is the most reliable fix.
 
 > PO tokens improve but do **not** guarantee bypassing bot checks. If blocks persist,
-> route yt-dlp through a residential/mobile proxy (`--proxy`).
+> route yt-dlp through a proxy via `YT_AUDIO_PROXIES`.
 
 ### 9. Cookie Refresh Reminder
 - **Admin** (`YT_AUDIO_ADMIN_ID`) is notified via Telegram when the cookies file is older than `YT_AUDIO_COOKIES_REMIND_DAYS` (default 14 days)

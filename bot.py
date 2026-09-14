@@ -67,7 +67,7 @@ DB_PATH = os.environ.get("YT_AUDIO_DB", "/opt/yt-audio-bot/bot.db")
 # YouTube player clients to try, in order (PO-token friendly clients first).
 YT_CLIENTS = tuple(
     c.strip() for c in os.environ.get(
-        "YT_AUDIO_CLIENTS", "android,ios,tv,web,mweb"
+        "YT_AUDIO_CLIENTS", "android,mweb,ios,web,tv"
     ).split(",") if c.strip()
 )
 # bgutil PO token provider (HTTP server). Disable with YT_AUDIO_POT_ENABLED=0.
@@ -86,8 +86,12 @@ YTDLP_RETRY_ARGS = [
 DOWNLOAD_TIMEOUT = int(os.environ.get("YT_AUDIO_DOWNLOAD_TIMEOUT", "1800"))
 EXTRACT_TIMEOUT = int(os.environ.get("YT_AUDIO_EXTRACT_TIMEOUT", "300"))
 # Extra full rounds over the client list when YouTube returns an anti-bot block
-YTDLP_ROUNDS = int(os.environ.get("YT_AUDIO_ROUNDS", "4"))
-YTDLP_ROUND_DELAY = int(os.environ.get("YT_AUDIO_ROUND_DELAY", "15"))
+YTDLP_ROUNDS = int(os.environ.get("YT_AUDIO_ROUNDS", "3"))
+YTDLP_ROUND_DELAY = int(os.environ.get("YT_AUDIO_ROUND_DELAY", "10"))
+# Optional proxy for yt-dlp. YT_AUDIO_PROXIES is a comma-separated list rotated per attempt;
+# YT_AUDIO_PROXY is a single fallback when the list is empty.
+YT_PROXY = os.environ.get("YT_AUDIO_PROXY", "").strip()
+YT_PROXIES = [p.strip() for p in os.environ.get("YT_AUDIO_PROXIES", "").split(",") if p.strip()]
 LOG_DIR = "/var/log/yt-audio-bot"
 LOG_MAX_SIZE = 1 * 1024 * 1024  # 1 MB per file
 LOG_BACKUP_COUNT = 3  # 3 files max = ~3 MB total
@@ -419,6 +423,15 @@ def _js_runtime_args() -> list:
     return []
 
 
+def _proxy_args(attempt: int) -> list:
+    """Return --proxy for the given attempt, rotating through the proxy list."""
+    if YT_PROXIES:
+        return ["--proxy", YT_PROXIES[attempt % len(YT_PROXIES)]]
+    if YT_PROXY:
+        return ["--proxy", YT_PROXY]
+    return []
+
+
 # Errors that mean the video itself is unusable — no point retrying.
 _NON_RETRYABLE_MARKERS = (
     "video unavailable",
@@ -443,12 +456,15 @@ def _do_download(ydl_opts: dict, url: str) -> dict:
     """Run yt-dlp download via CLI (more reliable than Python API)."""
     errors = []
     rounds = max(1, YTDLP_ROUNDS)
+    attempt = 0
     for round_no in range(rounds):
         for client in YT_CLIENTS:
             cmd = [YTDLP_PATH, "--no-warnings", "--ignore-no-formats-error"]
             cmd += _client_extractor_args(client)
             cmd += _js_runtime_args()
+            cmd += _proxy_args(attempt)
             cmd += YTDLP_RETRY_ARGS
+            attempt += 1
             fmt = ydl_opts.get("format", "worstaudio/worst")
             cmd += ["--format", fmt]
             outtmpl = ydl_opts.get("outtmpl", "%(title)s.%(ext)s")
@@ -494,12 +510,15 @@ def _do_extract_info(ydl_opts: dict, url: str) -> dict:
     """Run yt-dlp info extraction via CLI (more reliable format detection)."""
     errors = []
     rounds = max(1, YTDLP_ROUNDS)
+    attempt = 0
     for round_no in range(rounds):
         for client in YT_CLIENTS:
             cmd = [YTDLP_PATH, "--dump-json", "--no-warnings", "--ignore-no-formats-error"]
             cmd += _client_extractor_args(client)
             cmd += _js_runtime_args()
+            cmd += _proxy_args(attempt)
             cmd += YTDLP_RETRY_ARGS
+            attempt += 1
             if ydl_opts.get("cookiefile"):
                 cmd += ["--cookies", ydl_opts["cookiefile"]]
             cmd += [url]
