@@ -42,6 +42,7 @@ import base64
 from mutagen.oggopus import OggOpus
 from mutagen.flac import Picture
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
 
@@ -62,6 +63,31 @@ if ADMIN_ID:
 COOKIES_FILE = os.environ.get("YT_AUDIO_COOKIES", "/opt/yt-audio-bot/cookies.txt")
 YTDLP_PATH = os.environ.get("YTDLP_PATH", "/opt/yt-audio-bot/venv/bin/yt-dlp")
 DB_PATH = os.environ.get("YT_AUDIO_DB", "/opt/yt-audio-bot/bot.db")
+
+# YouTube player clients to try, in order (PO-token friendly clients first).
+YT_CLIENTS = tuple(
+    c.strip() for c in os.environ.get(
+        "YT_AUDIO_CLIENTS", "android,ios,tv,web,mweb"
+    ).split(",") if c.strip()
+)
+# bgutil PO token provider (HTTP server). Disable with YT_AUDIO_POT_ENABLED=0.
+POT_PROVIDER_ENABLED = os.environ.get("YT_AUDIO_POT_ENABLED", "1").lower() not in ("0", "false", "no")
+POT_PROVIDER_URL = os.environ.get("YT_AUDIO_POT_URL", "http://127.0.0.1:4416")
+# yt-dlp JavaScript runtime for n-sig/challenge solving (node:/abs/path or deno:/abs/path)
+YTDLP_JS_RUNTIME = os.environ.get("YT_AUDIO_JS_RUNTIME", "node:/usr/local/bin/node")
+# yt-dlp network robustness
+YTDLP_RETRY_ARGS = [
+    "--retries", "10",
+    "--fragment-retries", "10",
+    "--socket-timeout", "30",
+    "--extractor-retries", "3",
+    "--file-access-retries", "3",
+]
+DOWNLOAD_TIMEOUT = int(os.environ.get("YT_AUDIO_DOWNLOAD_TIMEOUT", "1800"))
+EXTRACT_TIMEOUT = int(os.environ.get("YT_AUDIO_EXTRACT_TIMEOUT", "300"))
+# Extra full rounds over the client list when YouTube returns an anti-bot block
+YTDLP_ROUNDS = int(os.environ.get("YT_AUDIO_ROUNDS", "4"))
+YTDLP_ROUND_DELAY = int(os.environ.get("YT_AUDIO_ROUND_DELAY", "15"))
 LOG_DIR = "/var/log/yt-audio-bot"
 LOG_MAX_SIZE = 1 * 1024 * 1024  # 1 MB per file
 LOG_BACKUP_COUNT = 3  # 3 files max = ~3 MB total
@@ -375,36 +401,91 @@ def cleanup_old_files():
         logger.info(f"Cleaned up {removed} old file(s)")
 
 
+def _client_extractor_args(client: str) -> list:
+    """Build --extractor-args for a player client, including the PO token provider."""
+    args = ["--extractor-args", f"youtube:player_client={client}"]
+    if POT_PROVIDER_ENABLED:
+        args += ["--extractor-args", f"youtubepot-bgutilhttp:base_url={POT_PROVIDER_URL}"]
+    return args
+
+
+def _js_runtime_args() -> list:
+    """Pass the JavaScript runtime to yt-dlp if it is available."""
+    if not YTDLP_JS_RUNTIME:
+        return []
+    path = YTDLP_JS_RUNTIME.split(":", 1)[-1]
+    if os.path.exists(path):
+        return ["--js-runtimes", YTDLP_JS_RUNTIME]
+    return []
+
+
+# Errors that mean the video itself is unusable — no point retrying.
+_NON_RETRYABLE_MARKERS = (
+    "video unavailable",
+    "this video is unavailable",
+    "private video",
+    "this video is private",
+    "unsupported url",
+    "video has been removed",
+    "incomplete youtube id",
+    "removed by the uploader",
+    "does not exist",
+    "is not available in your country",
+)
+
+
+def _is_retryable(errors: list) -> bool:
+    joined = " ".join(errors).lower()
+    return not any(marker in joined for marker in _NON_RETRYABLE_MARKERS)
+
+
 def _do_download(ydl_opts: dict, url: str) -> dict:
     """Run yt-dlp download via CLI (more reliable than Python API)."""
     errors = []
-    for client in ("web", "android"):
-        cmd = [YTDLP_PATH, "--no-warnings", "--ignore-no-formats-error",
-               "--extractor-args", f"youtube:player_client={client}"]
-        fmt = ydl_opts.get("format", "worstaudio/worst")
-        cmd += ["--format", fmt]
-        outtmpl = ydl_opts.get("outtmpl", "%(title)s.%(ext)s")
-        cmd += ["--output", outtmpl]
-        if ydl_opts.get("cookiefile"):
-            cmd += ["--cookies", ydl_opts["cookiefile"]]
-        cmd += [url]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if r.returncode == 0:
-            # Find the downloaded file via glob
-            outdir = os.path.dirname(outtmpl)
-            base = os.path.basename(outtmpl)
-            glob_pattern = re.sub(r"%\([^)]+\)[a-zA-Z]*", "*", base)
-            glob_path = os.path.join(outdir, glob_pattern)
-            candidates = sorted(glob.glob(glob_path), key=os.path.getmtime, reverse=True)
-            if candidates:
-                fp = candidates[0]
-                return {"filepath": fp, "ext": os.path.splitext(fp)[1].lstrip(".")}
-            # Download succeeded but file not found — record and try next
-            errors.append(f"[{client}] download OK but file not found: {glob_path}")
+    rounds = max(1, YTDLP_ROUNDS)
+    for round_no in range(rounds):
+        for client in YT_CLIENTS:
+            cmd = [YTDLP_PATH, "--no-warnings", "--ignore-no-formats-error"]
+            cmd += _client_extractor_args(client)
+            cmd += _js_runtime_args()
+            cmd += YTDLP_RETRY_ARGS
+            fmt = ydl_opts.get("format", "worstaudio/worst")
+            cmd += ["--format", fmt]
+            outtmpl = ydl_opts.get("outtmpl", "%(title)s.%(ext)s")
+            cmd += ["--output", outtmpl]
+            if ydl_opts.get("cookiefile"):
+                cmd += ["--cookies", ydl_opts["cookiefile"]]
+            cmd += [url]
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=DOWNLOAD_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                errors.append(f"[{client}] timeout after {DOWNLOAD_TIMEOUT}s")
+                logger.warning(f"yt-dlp download timeout: client={client}, url={url}")
+                continue
+            if r.returncode == 0:
+                # Find the downloaded file via glob
+                outdir = os.path.dirname(outtmpl)
+                base = os.path.basename(outtmpl)
+                glob_pattern = re.sub(r"%\([^)]+\)[a-zA-Z]*", "*", base)
+                glob_path = os.path.join(outdir, glob_pattern)
+                candidates = sorted(glob.glob(glob_path), key=os.path.getmtime, reverse=True)
+                if candidates:
+                    fp = candidates[0]
+                    return {"filepath": fp, "ext": os.path.splitext(fp)[1].lstrip(".")}
+                # Download succeeded but file not found — record and try next
+                errors.append(f"[{client}] download OK but file not found: {glob_path}")
+            else:
+                err_txt = (r.stderr or "").strip()[:300]
+                errors.append(f"[{client}] rc={r.returncode}. {err_txt}")
+        if round_no < rounds - 1 and _is_retryable(errors):
+            logger.warning(
+                f"yt-dlp download: round {round_no + 1}/{rounds} failed, "
+                f"retrying in {YTDLP_ROUND_DELAY}s"
+            )
+            time.sleep(YTDLP_ROUND_DELAY)
         else:
-            err_txt = (r.stderr or "").strip()[:300]
-            errors.append(f"[{client}] rc={r.returncode}. {err_txt}")
-    # All clients failed — combine all error details for diagnostics
+            break
+    # All attempts failed — combine all error details for diagnostics
     error_msg = " | ".join(errors) if errors else "Unknown error"
     raise yt_dlp.utils.DownloadError(error_msg)
 
@@ -412,30 +493,47 @@ def _do_download(ydl_opts: dict, url: str) -> dict:
 def _do_extract_info(ydl_opts: dict, url: str) -> dict:
     """Run yt-dlp info extraction via CLI (more reliable format detection)."""
     errors = []
-    for client in ("web", "android"):
-        cmd = [YTDLP_PATH, "--dump-json", "--no-warnings", "--ignore-no-formats-error",
-               "--extractor-args", f"youtube:player_client={client}"]
-        if ydl_opts.get("cookiefile"):
-            cmd += ["--cookies", ydl_opts["cookiefile"]]
-        cmd += [url]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if r.returncode == 0:
-            info = json.loads(r.stdout)
-            formats = info.get("formats") or []
-            has_media = any(
-                f.get("acodec", "none") not in ("none", None)
-                or f.get("vcodec", "none") not in ("none", None)
-                for f in formats
+    rounds = max(1, YTDLP_ROUNDS)
+    for round_no in range(rounds):
+        for client in YT_CLIENTS:
+            cmd = [YTDLP_PATH, "--dump-json", "--no-warnings", "--ignore-no-formats-error"]
+            cmd += _client_extractor_args(client)
+            cmd += _js_runtime_args()
+            cmd += YTDLP_RETRY_ARGS
+            if ydl_opts.get("cookiefile"):
+                cmd += ["--cookies", ydl_opts["cookiefile"]]
+            cmd += [url]
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=EXTRACT_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                errors.append(f"[{client}] timeout after {EXTRACT_TIMEOUT}s")
+                logger.warning(f"yt-dlp extract timeout: client={client}, url={url}")
+                continue
+            if r.returncode == 0:
+                info = json.loads(r.stdout)
+                formats = info.get("formats") or []
+                has_media = any(
+                    f.get("acodec", "none") not in ("none", None)
+                    or f.get("vcodec", "none") not in ("none", None)
+                    for f in formats
+                )
+                if has_media:
+                    return info
+                # No media formats — record and try next client
+                err_txt = (r.stderr or "").strip()[:300]
+                errors.append(f"[{client}] no media formats ({len(formats)} formats). {err_txt}")
+            else:
+                err_txt = (r.stderr or "").strip()[:300]
+                errors.append(f"[{client}] rc={r.returncode}. {err_txt}")
+        if round_no < rounds - 1 and _is_retryable(errors):
+            logger.warning(
+                f"yt-dlp extract: round {round_no + 1}/{rounds} failed, "
+                f"retrying in {YTDLP_ROUND_DELAY}s"
             )
-            if has_media:
-                return info
-            # No media formats — record and try next client
-            err_txt = (r.stderr or "").strip()[:300]
-            errors.append(f"[{client}] no media formats ({len(formats)} formats). {err_txt}")
+            time.sleep(YTDLP_ROUND_DELAY)
         else:
-            err_txt = (r.stderr or "").strip()[:300]
-            errors.append(f"[{client}] rc={r.returncode}. {err_txt}")
-    # All clients failed — combine all error details for diagnostics
+            break
+    # All attempts failed — combine all error details for diagnostics
     error_msg = " | ".join(errors) if errors else "Unknown error"
     raise yt_dlp.utils.DownloadError(error_msg)
 
@@ -1340,10 +1438,17 @@ async def _start_processing(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         _active_downloads[user_id]["stage"] = "done"
 
     except yt_dlp.utils.DownloadError as e:
-        logger.error(f"yt-dlp error: user={user_id}, video_id={video_id}, error={e}")
+        err_text = str(e)
+        logger.error(f"yt-dlp error: user={user_id}, video_id={video_id}, error={err_text}")
+        if ("Sign in to confirm" in err_text or "not a bot" in err_text
+                or "No video formats" in err_text or "no media formats" in err_text):
+            hint = ("YouTube требует подтверждение (антибот). Попробуй позже — "
+                    "если повторяется, администратору нужно обновить cookies.")
+        else:
+            hint = "Проверь ссылку или попробуй позже."
         if status_msg:
             await status_msg.edit_text(
-                f"❌ Не удалось скачать видео.\nПроверь ссылку или попробуй позже.\n\n<code>{escape_html(str(e)[:200])}</code>",
+                f"❌ Не удалось скачать видео.\n{hint}\n\n<code>{escape_html(err_text[:200])}</code>",
                 parse_mode="HTML"
             )
         success = False
@@ -1425,18 +1530,25 @@ async def check_cookies_job(context: ContextTypes.DEFAULT_TYPE):
         f"(рекомендуется обновлять каждые {COOKIES_REMIND_DAYS} дней).\n\n"
         "Протухшие cookies приводят к ошибкам скачивания "
         "(«Sign in to confirm you're not a bot», «No video formats found»).\n\n"
-        "Как обновить:\n"
-        "1. На локальной машине: <code>python3 -m yt_dlp --cookies-from-browser chrome -o /dev/null --cookies /tmp/yt_cookies.txt https://youtu.be/dQw4w9WgXcQ</code>\n"
-        "2. Загрузить на сервер:\n"
-        "<code>scp /tmp/yt_cookies.txt root@rom.zwitch.ru:/opt/yt-audio-bot/cookies.txt</code>\n"
-        "3. Перезапустить бота:\n"
-        "<code>systemctl restart yt-audio-bot</code>"
+        "Как обновить (с Mac):\n"
+        "1. <code>tools/export_youtube_cookies_macos.sh</code> — экспорт и загрузка cookies\n"
+        "2. На сервере: <code>systemctl restart yt-audio-bot</code>\n"
+        "Подробнее: <code>COOKIES_MAC.md</code>"
     )
     try:
         await context.bot.send_message(chat_id=ADMIN_ID, text=msg, parse_mode="HTML")
         logger.info(f"Cookie reminder sent to admin {ADMIN_ID} (age={int(age_days)} days)")
     except Exception as e:
         logger.error(f"Failed to send cookie reminder to {ADMIN_ID}: {e}")
+
+
+async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    """Log errors; treat transient Telegram network issues as warnings, not failures."""
+    err = context.error
+    if isinstance(err, (NetworkError, TimedOut)):
+        logger.warning(f"Telegram network error (transient): {type(err).__name__}: {err}")
+    else:
+        logger.error(f"Unhandled exception in handler: {err}", exc_info=err)
 
 
 def main():
@@ -1460,6 +1572,7 @@ def main():
     app.add_handler(CommandHandler("rated", cmd_rated))
     app.add_handler(CallbackQueryHandler(handle_rating, pattern=r"^rate:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_error_handler(error_handler)
 
     # Daily job: remind admin to refresh cookies (once a day at 09:00)
     try:

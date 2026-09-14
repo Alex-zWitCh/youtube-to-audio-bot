@@ -106,6 +106,10 @@ youtube-to-audio-bot/
 ├── install.sh              # Automated installer
 ├── yt-audio-bot.service    # systemd service file
 ├── yt-audio-cleanup        # Cron cleanup config
+├── TECH.md                 # Technical overview (architecture, env vars)
+├── COOKIES_MAC.md          # How to refresh YouTube cookies from a Mac
+├── tools/                  # Helper scripts (Mac cookie export)
+├── tests/                  # Unit tests (ratings)
 ├── README.md               # This file
 └── LICENSE
 ```

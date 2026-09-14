@@ -134,6 +134,14 @@ Environment="YT_AUDIO_COOKIES=$BOT_DIR/cookies.txt"
 Environment="YTDLP_PATH=$VENV_DIR/bin/yt-dlp"
 Environment="YT_AUDIO_COOKIES_REMIND_DAYS=14"
 Environment="YT_AUDIO_DB=$BOT_DIR/bot.db"
+Environment="YT_AUDIO_CLIENTS=android,ios,tv,web,mweb"
+Environment="YT_AUDIO_POT_ENABLED=1"
+Environment="YT_AUDIO_POT_URL=http://127.0.0.1:4416"
+Environment="YT_AUDIO_JS_RUNTIME=node:/usr/local/bin/node"
+Environment="YT_AUDIO_DOWNLOAD_TIMEOUT=1800"
+Environment="YT_AUDIO_EXTRACT_TIMEOUT=300"
+Environment="YT_AUDIO_ROUNDS=4"
+Environment="YT_AUDIO_ROUND_DELAY=15"
 Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.deno/bin"
 ExecStart=$VENV_DIR/bin/python3 $BOT_DIR/bot.py
 Restart=on-failure
@@ -147,6 +155,18 @@ systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
 systemctl start "$SERVICE_NAME"
 log "systemd service created and started"
+
+# ── Step 6b: PO token provider (bgutil) for YouTube ──
+info "Setting up YouTube PO token provider (bgutil)..."
+if command -v docker &>/dev/null; then
+    docker rm -f bgutil-provider >/dev/null 2>&1 || true
+    docker run -d --name bgutil-provider --init --restart unless-stopped \
+        -p 127.0.0.1:4416:4416 brainicism/bgutil-ytdlp-pot-provider >/dev/null
+    "$VENV_DIR/bin/pip" install -q -U bgutil-ytdlp-pot-provider
+    log "PO token provider running on 127.0.0.1:4416"
+else
+    warn "Docker not found — PO token provider not installed (YouTube may require it)"
+fi
 
 # ── Step 7: Cron cleanup ──
 info "Setting up hourly cleanup..."

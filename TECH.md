@@ -111,6 +111,30 @@ The bot uses **CLI `yt-dlp`** (not the Python API) because the Python API can mi
 | `YTDLP_PATH` | `/opt/yt-audio-bot/venv/bin/yt-dlp` | Path to yt-dlp binary |
 | `YT_AUDIO_COOKIES_REMIND_DAYS` | 14 | After N days without refresh, admin gets a cookie-refresh reminder |
 | `YT_AUDIO_DB` | `/opt/yt-audio-bot/bot.db` | SQLite database (file_id cache + usage stats) |
+| `YT_AUDIO_CLIENTS` | `android,ios,tv,web,mweb` | YouTube player clients to try, in order |
+| `YT_AUDIO_POT_ENABLED` | `1` | Use the bgutil PO token provider (`0` disables) |
+| `YT_AUDIO_POT_URL` | `http://127.0.0.1:4416` | bgutil PO token provider base URL |
+| `YT_AUDIO_JS_RUNTIME` | `node:/usr/local/bin/node` | JS runtime passed to yt-dlp via `--js-runtimes` |
+| `YT_AUDIO_DOWNLOAD_TIMEOUT` | 1800 | Per-client download timeout (seconds) |
+| `YT_AUDIO_EXTRACT_TIMEOUT` | 300 | Per-client info-extraction timeout (seconds) |
+| `YT_AUDIO_ROUNDS` | 4 | Full retry rounds over the client list on anti-bot blocks |
+| `YT_AUDIO_ROUND_DELAY` | 15 | Delay between retry rounds (seconds) |
+
+### 11. YouTube Anti-Bot Resilience (PO Token + retries)
+YouTube increasingly blocks datacenter IPs with *"Sign in to confirm you're not a bot"*.
+The bot mitigates this with:
+- **PO token provider** — [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)
+  HTTP server on `127.0.0.1:4416` (systemd `bgutil-pot-provider.service`), plus the
+  `bgutil-ytdlp-pot-provider` yt-dlp plugin installed in the bot venv.
+- **JS runtime** — Node is passed via `--js-runtimes` so yt-dlp can solve n-sig challenges.
+- **Client rotation** — multiple player clients, mobile clients first.
+- **Retry rounds** — if all clients fail with a retryable error, the whole list is retried
+  after `YT_AUDIO_ROUND_DELAY` seconds, up to `YT_AUDIO_ROUNDS` times.
+- **Cookies** — fresh YouTube cookies still matter; see `COOKIES_MAC.md` for exporting them
+  from a Mac browser via `tools/export_youtube_cookies_macos.sh`.
+
+> PO tokens improve but do **not** guarantee bypassing bot checks. If blocks persist,
+> route yt-dlp through a residential/mobile proxy (`--proxy`).
 
 ### 9. Cookie Refresh Reminder
 - **Admin** (`YT_AUDIO_ADMIN_ID`) is notified via Telegram when the cookies file is older than `YT_AUDIO_COOKIES_REMIND_DAYS` (default 14 days)
