@@ -121,6 +121,8 @@ The bot uses **CLI `yt-dlp`** (not the Python API) because the Python API can mi
 | `YT_AUDIO_ROUND_DELAY` | 10 | Delay between retry rounds (seconds) |
 | `YT_AUDIO_PROXIES` | — | Comma-separated proxy URLs, rotated per attempt (recommended on datacenter IPs) |
 | `YT_AUDIO_PROXY` | — | Single proxy URL, used when `YT_AUDIO_PROXIES` is empty |
+| `YT_AUDIO_WEBHOOK_GUARD` | `1` | Periodically delete foreign webhooks that would block polling |
+| `YT_AUDIO_WEBHOOK_GUARD_INTERVAL` | `300` | Webhook guard check interval (seconds) |
 
 ### 11. YouTube Anti-Bot Resilience (PO Token + retries)
 YouTube increasingly blocks datacenter IPs with *"Sign in to confirm you're not a bot"*.

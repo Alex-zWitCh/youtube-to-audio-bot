@@ -144,6 +144,8 @@ Environment="YT_AUDIO_ROUNDS=3"
 Environment="YT_AUDIO_ROUND_DELAY=10"
 Environment="YT_AUDIO_PROXIES="
 Environment="YT_AUDIO_PROXY="
+Environment="YT_AUDIO_WEBHOOK_GUARD=1"
+Environment="YT_AUDIO_WEBHOOK_GUARD_INTERVAL=300"
 Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.deno/bin"
 ExecStart=$VENV_DIR/bin/python3 $BOT_DIR/bot.py
 Restart=on-failure

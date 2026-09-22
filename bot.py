@@ -1570,6 +1570,42 @@ async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Unhandled exception in handler: {err}", exc_info=err)
 
 
+# Guard against foreign webhooks hijacking polling (this bot only uses polling).
+WEBHOOK_GUARD_ENABLED = os.environ.get("YT_AUDIO_WEBHOOK_GUARD", "1").lower() not in ("0", "false", "no")
+WEBHOOK_GUARD_INTERVAL = int(os.environ.get("YT_AUDIO_WEBHOOK_GUARD_INTERVAL", "300"))
+
+
+async def check_webhook_job(context: ContextTypes.DEFAULT_TYPE):
+    """Delete any foreign webhook so polling keeps working; alert the admin."""
+    if not WEBHOOK_GUARD_ENABLED:
+        return
+    try:
+        info = await context.bot.get_webhook_info()
+        url = (info.url or "").strip()
+        if not url:
+            return
+        logger.warning(f"Foreign webhook detected: {url} (pending={info.pending_update_count}). Deleting.")
+        await context.bot.delete_webhook()
+        logger.warning("Foreign webhook deleted; polling should resume.")
+        if ADMIN_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=(
+                        "🚨 <b>Обнаружен чужой webhook — удалён</b>\n\n"
+                        f"URL: <code>{escape_html(url)}</code>\n"
+                        f"Ожидало доставки: <b>{info.pending_update_count}</b>\n\n"
+                        "Кто-то владеет токеном бота и перехватывает сообщения. "
+                        "Срочно пересоздайте токен в BotFather (/revoke) и обновите его на сервере!"
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logger.warning(f"Could not notify admin about webhook: {e}")
+    except Exception:
+        logger.error(f"Webhook guard failed: {traceback.format_exc()}")
+
+
 def main():
     if not BOT_TOKEN:
         logger.error("❌ YT_AUDIO_BOT_TOKEN environment variable not set!")
@@ -1605,6 +1641,16 @@ def main():
         app.job_queue.run_once(check_cookies_job, when=60)
     except Exception as e:
         logger.warning(f"Could not schedule startup cookie check: {e}")
+
+    # Webhook guard: a foreign webhook blocks polling, so detect and remove it.
+    try:
+        app.job_queue.run_once(check_webhook_job, when=15)
+        app.job_queue.run_repeating(
+            check_webhook_job, interval=WEBHOOK_GUARD_INTERVAL, first=WEBHOOK_GUARD_INTERVAL
+        )
+        logger.info(f"Scheduled webhook guard every {WEBHOOK_GUARD_INTERVAL}s")
+    except Exception as e:
+        logger.warning(f"Could not schedule webhook guard: {e}")
 
     logger.info("🤖 Bot started!")
     app.run_polling()

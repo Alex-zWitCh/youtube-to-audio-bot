@@ -26,6 +26,9 @@ Environment="YT_AUDIO_ROUND_DELAY=10"
 # through a proxy and avoid YouTube datacenter-IP bot checks.
 Environment="YT_AUDIO_PROXIES="
 Environment="YT_AUDIO_PROXY="
+# Webhook guard: delete foreign webhooks that would block polling (1 = on).
+Environment="YT_AUDIO_WEBHOOK_GUARD=1"
+Environment="YT_AUDIO_WEBHOOK_GUARD_INTERVAL=300"
 Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.deno/bin"
 ExecStart=/opt/yt-audio-bot/venv/bin/python3 /opt/yt-audio-bot/bot.py
 Restart=on-failure
