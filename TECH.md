@@ -100,7 +100,7 @@ The bot uses **CLI `yt-dlp`** (not the Python API) because the Python API can mi
 |---|---|---|
 | `YT_AUDIO_BOT_TOKEN` | — | **Required.** Telegram Bot Token |
 | `DOWNLOAD_DIR` | `/tmp/yt-audio-downloads` | Temp directory |
-| `MAX_FILE_SIZE` | 45 MB | Split threshold |
+| `MAX_FILE_SIZE` | 20 MB | Split threshold |
 | `CLEANUP_AGE` | 3600 (1h) | Max file age before cleanup |
 | `LOG_DIR` | `/var/log/yt-audio-bot` | Log directory |
 | `LOG_MAX_SIZE` | 1 MB | Rotating log file size |

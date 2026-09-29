@@ -52,7 +52,10 @@ from telegram.request import HTTPXRequest
 
 BOT_TOKEN = os.environ.get("YT_AUDIO_BOT_TOKEN", "")
 DOWNLOAD_DIR = "/tmp/yt-audio-downloads"
-MAX_FILE_SIZE = 45 * 1024 * 1024  # 45 MB safety margin
+MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB upload-reliability threshold; Telegram gateway times out on ~40 MB uploads
+# Upload retries for transient Telegram 5xx/network errors (Gateway Timeout etc.)
+SEND_ATTEMPTS = 5
+SEND_RETRY_DELAYS = (5, 15, 45, 120)  # seconds between attempts
 CLEANUP_AGE = 3600  # 1 hour
 MAX_QUEUE_SIZE = 5  # max waiting users (anti-DDoS)
 ADMIN_ID = int(os.environ.get("YT_AUDIO_ADMIN_ID", "0") or "0")  # bot admin (privileged user)
@@ -754,7 +757,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Просто отправь ссылку на YouTube видео — "
         "получишь аудио в максимально сжатом виде.\n\n"
         "🔹 <b>Формат:</b> Opus 12kbps, моно, 16 кГц\n"
-        "🔹 <b>Сплит:</b> если >50 МБ — разбивается на части\n"
+        "🔹 <b>Сплит:</b> если >20 МБ — разбивается на части\n"
         "🔹 <b>CPU:</b> низкий приоритет, не нагружает сервер\n"
         "🔹 <b>Поддерживаются:</b> youtube.com, youtu.be\n\n"
         "Пример:\n"
@@ -787,7 +790,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /cancel — отменить текущую загрузку\n"
         "  /rated — мои оценённые аудио\n\n"
         "<b>Формат на выходе:</b> Opus 12kbps, моно, 16 кГц\n"
-        "<b>Ограничение:</b> до 50 МБ (с авто-сплитом)\n\n"
+        "<b>Ограничение:</b> файлы отправляются частями примерно до 20 МБ\n\n"
         "⚡ Процесс конвертации имеет низкий приоритет\n"
         "и не нагружает сервер.",
         parse_mode="HTML",
@@ -985,7 +988,29 @@ async def _try_send_cached(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         return False
 
 
+_live_handlers: set = set()  # user_ids with a handle_message task currently running
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry point: serialize per-user handling so two updates can never start duplicate pipelines."""
+    try:
+        user_id = update.effective_user.id
+    except Exception:
+        return await _handle_message(update, context)
+    if user_id in _live_handlers:
+        await update.message.reply_text(
+            "⏳ Уже обрабатываю ссылку. Дождись завершения или отправь /cancel.",
+            reply_to_message_id=update.message.message_id
+        )
+        return
+    _live_handlers.add(user_id)
+    try:
+        await _handle_message(update, context)
+    finally:
+        _live_handlers.discard(user_id)
+
+
+async def _handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     youtube_pattern = re.compile(
@@ -1369,7 +1394,7 @@ async def _start_processing(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             reply_markup = rating_keyboard(video_id) if part_num == total else None
             sent = None
             last_err = None
-            for attempt in range(2):
+            for attempt in range(SEND_ATTEMPTS):
                 try:
                     with open(part_path, "rb") as f:
                         sent = await update.message.reply_audio(
@@ -1379,10 +1404,26 @@ async def _start_processing(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                             reply_to_message_id=update.message.message_id
                         )
                     break
+                except (NetworkError, TimedOut) as e:
+                    last_err = e
+                    logger.error(f"Send part {part_num}/{total} attempt {attempt + 1}/{SEND_ATTEMPTS} failed: user={user_id}, error={type(e).__name__}: {e}")
+                    if attempt < SEND_ATTEMPTS - 1:
+                        delay = SEND_RETRY_DELAYS[attempt] if attempt < len(SEND_RETRY_DELAYS) else SEND_RETRY_DELAYS[-1]
+                        if status_msg:
+                            try:
+                                await status_msg.edit_text(
+                                    f"📤 <b>{escape_html(title)}</b>\n"
+                                    f"⚠️ Telegram не отвечает ({escape_html(type(e).__name__)}), "
+                                    f"повтор {attempt + 2}/{SEND_ATTEMPTS} через {delay}с…",
+                                    parse_mode="HTML"
+                                )
+                            except Exception:
+                                pass
+                        await asyncio.sleep(delay)
                 except Exception as e:
                     last_err = e
-                    logger.error(f"Send part {part_num}/{total} attempt {attempt + 1}/2 failed: user={user_id}, error={type(e).__name__}: {e}")
-                    await asyncio.sleep(2)
+                    logger.error(f"Send part {part_num}/{total} attempt {attempt + 1}/{SEND_ATTEMPTS} failed (not retryable): user={user_id}, error={type(e).__name__}: {e}")
+                    break
 
             if sent is None:
                 if last_err is not None and "VOICE_MESSAGES_FORBIDDEN" in str(last_err):
@@ -1453,8 +1494,9 @@ async def _start_processing(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         except Exception as e:
             logger.warning(f"Failed to log download: {e}")
 
-        success = True
-        _active_downloads[user_id]["stage"] = "done"
+        success = not send_failures
+        if user_id in _active_downloads:
+            _active_downloads[user_id]["stage"] = "done"
 
     except yt_dlp.utils.DownloadError as e:
         err_text = str(e)
@@ -1470,6 +1512,10 @@ async def _start_processing(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 f"❌ Не удалось скачать видео.\n{hint}\n\n<code>{escape_html(err_text[:200])}</code>",
                 parse_mode="HTML"
             )
+        success = False
+    except KeyError:
+        # Task state vanished mid-flight (cancelled or superseded) — abort quietly.
+        logger.info(f"Task state gone, aborting: user={user_id}, video_id={video_id}")
         success = False
     except Exception as e:
         logger.error(f"Unexpected error: user={user_id}, video_id={video_id}, error={traceback.format_exc()}")

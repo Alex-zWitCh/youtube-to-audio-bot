@@ -7,7 +7,7 @@ A Telegram bot that converts YouTube videos to ultra-compressed Opus audio (12 k
 - 🔹 **Format:** Opus 12 kbps, mono, 16 kHz (speech-optimized)
 - 🔹 **Cover art:** YouTube thumbnail embedded as album artwork
 - 🔹 **Metadata:** title, author, description, source link embedded in file
-- 🔹 **Auto-split:** files larger than 45 MB are split into numbered parts (`part 1 of 4`, etc.)
+- 🔹 **Auto-split:** files larger than 20 MB are split into numbered parts (`part 1 of 4`, etc.)
 - 🔹 **Low CPU impact:** `nice -n 19` + `ionice -c 3` + single thread — minimal server load
 - 🔹 **Progress indicator:** shows download speed + encoding progress with ETA
 - 🔹 **Queue system:** max 5 waiting users — anti-DDoS protection
@@ -29,7 +29,7 @@ User sends YouTube link
        → Downloads audio (falls back to android client if needed)
        → ffmpeg converts to Opus 12 kbps mono 16 kHz (nice + ionice)
        → mutagen embeds cover art and metadata
-       → If >45 MB: splits into parts
+       → If >20 MB: splits into parts
        → Sends file(s) via Telegram → saves file_id to cache → Deletes from server
 ```
 
@@ -72,7 +72,7 @@ All configuration is via environment variables (set in the systemd service file)
 |---|---|---|
 | `YT_AUDIO_BOT_TOKEN` | — | **Required.** Telegram Bot Token |
 | `DOWNLOAD_DIR` | `/tmp/yt-audio-downloads` | Temp directory for downloads |
-| `MAX_FILE_SIZE` | `45 MB` | Split threshold |
+| `MAX_FILE_SIZE` | `20 MB` | Split threshold |
 | `CLEANUP_AGE` | `3600` (1 hour) | Max file age before cleanup |
 | `YT_AUDIO_ADMIN_ID` | — | Telegram user ID of the bot admin (always VIP) |
 | `YT_AUDIO_VIP_USERS` | — | Comma-separated Telegram user IDs with queue priority |
@@ -126,7 +126,7 @@ youtube-to-audio-bot/
    - Sample rate: 16 kHz (`-ar 16000`)
    - Threads: 1
 3. **mutagen** embeds YouTube thumbnail as cover art
-4. If output > 45 MB: **ffmpeg** splits by duration using stream copy
+4. If output > 20 MB: **ffmpeg** splits by duration using stream copy
 5. Telegram stores the audio in its cloud; the returned **`file_id`** is saved to SQLite for instant reuse
 
 ### CPU Throttling
@@ -140,9 +140,9 @@ nice -n 19 → ionice -c 3 → ffmpeg -threads 1
 
 ### File Splitting
 
-When the compressed audio exceeds 45 MB:
+When the compressed audio exceeds 20 MB:
 1. Total duration is calculated via `ffprobe`
-2. Number of parts = `ceil(file_size / 45 MB)`
+2. Number of parts = `ceil(file_size / 20 MB)`
 3. Each part is extracted using `ffmpeg -ss` / `-to` with stream copy
 4. Files are sent as `Title_part1_of_4.opus`, `Title_part2_of_4.opus`, etc.
 
@@ -250,7 +250,7 @@ curl -sSL https://raw.githubusercontent.com/Alex-zWitCh/youtube-to-audio-bot/mai
 |---|---|---|
 | `YT_AUDIO_BOT_TOKEN` | — | **Обязательно.** Токен бота Telegram |
 | `DOWNLOAD_DIR` | `/tmp/yt-audio-downloads` | Временная папка для загрузок |
-| `MAX_FILE_SIZE` | `45 MB` | Порог для сплита |
+| `MAX_FILE_SIZE` | `20 MB` | Порог для сплита |
 | `CLEANUP_AGE` | `3600` (1 час) | Макс. возраст файла перед очисткой |
 | `YT_AUDIO_VIP_USERS` | — | ID пользователей Telegram через запятую (приоритет очереди) |
 
@@ -264,4 +264,4 @@ curl -sSL https://raw.githubusercontent.com/Alex-zWitCh/youtube-to-audio-bot/mai
 
 **CPU Throttling:** `nice -n 19 → ionice -c 3 → ffmpeg -threads 1` — минимальный приоритет планировщика и idle I/O, конвертация не мешает другим сервисам.
 
-**Сплит файлов:** `ceil(размер / 45 MB)` частей, каждая вырезается через `ffmpeg -ss`/`-to` с stream copy. Имена: `Название_часть1_из_4.opus`, `Название_часть2_из_4.opus`...
+**Сплит файлов:** `ceil(размер / 20 MB)` частей, каждая вырезается через `ffmpeg -ss`/`-to` с stream copy. Имена: `Название_часть1_из_4.opus`, `Название_часть2_из_4.opus`...
