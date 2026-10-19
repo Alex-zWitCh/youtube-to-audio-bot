@@ -54,6 +54,9 @@ BOT_TOKEN = os.environ.get("YT_AUDIO_BOT_TOKEN", "")
 DOWNLOAD_DIR = "/tmp/yt-audio-downloads"
 MAX_FILE_SIZE = int(float(os.environ.get("YT_AUDIO_MAX_FILE_SIZE_MB", "36")) * 1024 * 1024)  # 36 MB default; split larger files
 SPLIT_OVERLAP_SEC = float(os.environ.get("YT_AUDIO_SPLIT_OVERLAP_SEC", "5"))  # overlap between parts so nothing is lost at cuts
+# Max allowed shortfall when verifying audio durations (catches silent
+# truncation; stream-copy cut precision is ~0.1s, so anything bigger is real loss).
+DURATION_VERIFY_TOL_SEC = 10.0
 # Upload retries for transient Telegram 5xx/network errors (Gateway Timeout etc.)
 SEND_ATTEMPTS = 5
 SEND_RETRY_DELAYS = (5, 15, 45, 120)  # seconds between attempts
@@ -629,6 +632,32 @@ async def run_ffmpeg_with_progress(
     return proc.returncode
 
 
+def _probe_audio(path: str) -> tuple[float, float]:
+    """Return (start_time, duration) of an audio file via ffprobe."""
+    probe = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", path],
+        capture_output=True, text=True,
+    )
+    data = json.loads(probe.stdout)["format"]
+    start = float(data.get("start_time", 0) or 0)
+    return start, float(data["duration"])
+
+
+def _verify_output_duration(path: str, expected: float, label: str) -> float:
+    """Check converted audio duration against expected; raise on major mismatch."""
+    try:
+        _, actual = _probe_audio(path)
+    except Exception as e:
+        logger.warning(f"Could not verify {label} duration: {e}")
+        return 0.0
+    if expected and expected > 0 and actual < expected - max(30.0, 0.02 * expected):
+        raise Exception(
+            f"Длительность результата ({format_duration(int(actual))}) сильно отличается "
+            f"от исходной ({format_duration(int(expected))}) — файл, возможно, обрезан."
+        )
+    return actual
+
+
 def split_audio_file(file_path: str, max_size: int, base_name: str, overlap_sec: float = None) -> list:
     """
     Split audio file into parts if it exceeds max_size.
@@ -707,7 +736,18 @@ def split_audio_file(file_path: str, max_size: int, base_name: str, overlap_sec:
             actual_duration = total_duration - start
 
         subprocess.run(split_cmd, capture_output=True, check=True)
-        parts.append((part_path, part_num, num_parts, actual_duration))
+        try:
+            _, measured_dur = _probe_audio(part_path)
+        except Exception as e:
+            logger.warning(f"Could not probe part {part_num}/{num_parts}, using expected duration: {e}")
+            measured_dur = actual_duration
+        if measured_dur < actual_duration - DURATION_VERIFY_TOL_SEC:
+            raise Exception(
+                f"Часть {part_num}/{num_parts} короче ожидаемого "
+                f"({format_duration(int(measured_dur))} вместо {format_duration(int(actual_duration))}) — "
+                f"возможно, потерян кусок аудио."
+            )
+        parts.append((part_path, part_num, num_parts, measured_dur))
 
     # Remove original file
     os.remove(file_path)
@@ -1346,6 +1386,9 @@ async def _start_processing(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
         if not os.path.exists(output_path):
             raise Exception("Output file not found after conversion")
+
+        # Guard against silent truncation: converted audio must match source length.
+        _verify_output_duration(output_path, duration, f"video_id={video_id}")
 
         # ── Step 5: Check size, split if needed ──
         _active_downloads[user_id]["stage"] = "splitting"

@@ -143,6 +143,7 @@ nice -n 19 → ionice -c 3 → ffmpeg -threads 1
 When the compressed audio exceeds 36 MB:
 1. Total duration is calculated via `ffprobe`
 2. Number of parts = `ceil(file_size / 36 MB)`; each part after the first starts 5 seconds earlier so nothing is lost at cuts
+3. Integrity checks: converted audio duration is verified against the source; each part shorter than expected by >10s aborts the job instead of sending truncated audio
 3. Each part is extracted using `ffmpeg -ss` / `-to` with stream copy
 4. Files are sent as `Title_part1_of_4.opus`, `Title_part2_of_4.opus`, etc.
 
@@ -264,4 +265,4 @@ curl -sSL https://raw.githubusercontent.com/Alex-zWitCh/youtube-to-audio-bot/mai
 
 **CPU Throttling:** `nice -n 19 → ionice -c 3 → ffmpeg -threads 1` — минимальный приоритет планировщика и idle I/O, конвертация не мешает другим сервисам.
 
-**Сплит файлов:** `ceil(размер / 36 MB)` частей, каждая вырезается через `ffmpeg -ss`/`-to` с stream copy; каждая следующая часть начинается на 5 секунд раньше, чтобы ничего не потерялось на стыке. Имена: `Название_часть1_из_4.opus`, `Название_часть2_из_4.opus`...
+**Сплит файлов:** `ceil(размер / 36 MB)` частей, каждая вырезается через `ffmpeg -ss`/`-to` с stream copy; каждая следующая часть начинается на 5 секунд раньше, чтобы ничего не потерялось на стыке. Имена: `Название_часть1_из_4.opus`, `Название_часть2_из_4.opus`... Проверки целостности: длительность результата сверяется с исходной, часть короче ожидаемой более чем на 10 с бракует задачу, а не уходит пользователю обрезанной.
