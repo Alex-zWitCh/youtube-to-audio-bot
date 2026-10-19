@@ -7,7 +7,7 @@
 Особенности:
   - CPU throttling: nice + ionice + single thread (минимальная нагрузка)
   - Прогресс конвертации с оценкой времени (таймер)
-  - Авто-сплит файлов >45MB на части
+  - Авто-сплит файлов >36MB на части (с нахлёстом 5с между частями)
   - Публичный, любой может отправить ссылку
 
 Требования:
@@ -52,7 +52,8 @@ from telegram.request import HTTPXRequest
 
 BOT_TOKEN = os.environ.get("YT_AUDIO_BOT_TOKEN", "")
 DOWNLOAD_DIR = "/tmp/yt-audio-downloads"
-MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB upload-reliability threshold; Telegram gateway times out on ~40 MB uploads
+MAX_FILE_SIZE = int(float(os.environ.get("YT_AUDIO_MAX_FILE_SIZE_MB", "36")) * 1024 * 1024)  # 36 MB default; split larger files
+SPLIT_OVERLAP_SEC = float(os.environ.get("YT_AUDIO_SPLIT_OVERLAP_SEC", "5"))  # overlap between parts so nothing is lost at cuts
 # Upload retries for transient Telegram 5xx/network errors (Gateway Timeout etc.)
 SEND_ATTEMPTS = 5
 SEND_RETRY_DELAYS = (5, 15, 45, 120)  # seconds between attempts
@@ -628,12 +629,16 @@ async def run_ffmpeg_with_progress(
     return proc.returncode
 
 
-def split_audio_file(file_path: str, max_size: int, base_name: str) -> list:
+def split_audio_file(file_path: str, max_size: int, base_name: str, overlap_sec: float = None) -> list:
     """
     Split audio file into parts if it exceeds max_size.
     Uses ffmpeg with -ss/-to and stream copy.
+    Each part after the first starts `overlap_sec` earlier, so the tail of the
+    previous part is repeated and no speech is lost at cut points.
     Returns list of (part_path, part_number, total_parts, part_duration_secs).
     """
+    if overlap_sec is None:
+        overlap_sec = SPLIT_OVERLAP_SEC
     file_size = os.path.getsize(file_path)
     if file_size <= max_size:
         # Probe actual duration of single file
@@ -660,6 +665,9 @@ def split_audio_file(file_path: str, max_size: int, base_name: str) -> list:
     # Calculate number of parts and duration per part
     num_parts = math.ceil(file_size / max_size)
     part_duration = total_duration / num_parts
+    overlap = max(0.0, float(overlap_sec or 0.0))
+    if num_parts > 1 and overlap >= part_duration:
+        overlap = part_duration / 2
 
     dir_name = os.path.dirname(file_path)
     ext = os.path.splitext(file_path)[1]
@@ -670,20 +678,22 @@ def split_audio_file(file_path: str, max_size: int, base_name: str) -> list:
         part_path = os.path.join(
             dir_name, f"{base_name}_part{part_num}_of_{num_parts}{ext}"
         )
-        start = i * part_duration
+        nominal_start = i * part_duration
+        start = max(0.0, nominal_start - overlap) if i > 0 else 0.0
 
         if i < num_parts - 1:
+            end = nominal_start + part_duration
             split_cmd = [
                 "nice", "-n", "19",
                 "ffmpeg",
                 "-i", file_path,
                 "-ss", str(start),
-                "-to", str(start + part_duration),
+                "-to", str(end),
                 "-c", "copy",
                 "-y",
                 part_path
             ]
-            actual_duration = part_duration
+            actual_duration = end - start
         else:
             split_cmd = [
                 "nice", "-n", "19",
@@ -757,7 +767,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Просто отправь ссылку на YouTube видео — "
         "получишь аудио в максимально сжатом виде.\n\n"
         "🔹 <b>Формат:</b> Opus 12kbps, моно, 16 кГц\n"
-        "🔹 <b>Сплит:</b> если >20 МБ — разбивается на части\n"
+        "🔹 <b>Сплит:</b> если >26 МБ — разбивается на части\n"
         "🔹 <b>CPU:</b> низкий приоритет, не нагружает сервер\n"
         "🔹 <b>Поддерживаются:</b> youtube.com, youtu.be\n\n"
         "Пример:\n"
@@ -790,7 +800,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /cancel — отменить текущую загрузку\n"
         "  /rated — мои оценённые аудио\n\n"
         "<b>Формат на выходе:</b> Opus 12kbps, моно, 16 кГц\n"
-        "<b>Ограничение:</b> файлы отправляются частями примерно до 20 МБ\n\n"
+        "<b>Ограничение:</b> файлы отправляются частями примерно до 26 МБ\n\n"
         "⚡ Процесс конвертации имеет низкий приоритет\n"
         "и не нагружает сервер.",
         parse_mode="HTML",
@@ -1348,7 +1358,7 @@ async def _start_processing(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                 parse_mode="HTML"
             )
             parts = await loop.run_in_executor(None, split_audio_file, output_path, MAX_FILE_SIZE, f"{timestamp}_{safe_title}")
-            logger.info(f"Split: {len(parts)} parts, file={format_size(file_size)}")
+            logger.info(f"Split: {len(parts)} parts, file={format_size(file_size)}, overlap={SPLIT_OVERLAP_SEC:g}s")
         else:
             probe_cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", output_path]
             probe_r = await loop.run_in_executor(None, lambda: subprocess.run(probe_cmd, capture_output=True, text=True))
@@ -1370,6 +1380,8 @@ async def _start_processing(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             ]
             if total > 1:
                 caption_parts.append(f"📦 Часть {part_num} из {total} — {format_size(part_size)}")
+                if SPLIT_OVERLAP_SEC > 0:
+                    caption_parts.append(f"🔁 Нахлёст {SPLIT_OVERLAP_SEC:g} с для бесшовности")
             else:
                 caption_parts.append(f"📦 {format_size(part_size)} | Opus 12kbps")
 
